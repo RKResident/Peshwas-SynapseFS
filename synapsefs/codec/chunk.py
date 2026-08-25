@@ -1,0 +1,415 @@
+"""Chunk codec: bit-exact residual encode/decode (FORMAT.md section 8).
+
+One chunk in, one chunk out. This module knows nothing about tensors, files,
+manifests, or chunking policy -- it operates on a flat stream of raw bit
+patterns and an element width. Everything above it (which rows form a chunk,
+where the bytes came from) is `checkpoint.py`'s job; everything below it
+(where the payload lands) is the pack writer's.
+
+Three properties this module guarantees, each pinned by a test:
+
+- **Byte-exact.** Every step is integer arithmetic on raw bit patterns. No
+  floating-point operation occurs anywhere in this file, so reconstruction is
+  exact unconditionally rather than "exact in practice". NaN, Inf, denormals
+  and both signed zeros round-trip because nothing here interprets them as
+  numbers.
+- **No inflation.** The delta stream is exactly as many bytes as the tensor
+  chunk it encodes -- see `zigzag` for why no widening is needed.
+- **Content hashes cover uncompressed bytes.** Changing the zstd level or
+  adding a pack dictionary must never fork a chunk's identity (FORMAT.md
+  section 2), so the hash is taken before compression, never after.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import blake3
+import numpy as np
+import zstandard as zstd
+
+__all__ = [
+    "EncodedChunk",
+    "encode_chunk",
+    "decode_chunk",
+    "to_monotone_key",
+    "from_monotone_key",
+    "zigzag",
+    "unzigzag",
+    "dtype_spec",
+    "RAW",
+    "RAW_ZSTD",
+    "DELTA",
+]
+
+RAW = "raw"
+RAW_ZSTD = "raw-zstd"
+DELTA = "delta-zigzag-zstd"
+
+DEFAULT_LEVEL = 3
+
+# Key kinds. Which order-preserving map applies depends on how the dtype lays
+# out its sign, not on how wide it is -- so width and kind are tracked apart.
+FLOAT = "float"  # IEEE-754 style sign-magnitude: sign bit, then magnitude.
+SINT = "sint"    # two's complement.
+
+# safetensors dtype name -> (element width in bytes, key kind).
+#
+# Deliberately short. The PS grades checkpoints "in fp16/bf16 precision (not
+# fp32)", so F16/BF16 are the only dtypes the weights themselves will use.
+# The other two are not speculation:
+#
+#   F32 -- `tools/gen_fixtures.py` emits it, and an export that was never
+#          .half()'d is fp32 throughout.
+#   I64 -- a `.half()`'d ResNet-style model *still* carries an int64 0-d
+#          `num_batches_tracked` buffer per BatchNorm, because .half() does
+#          not touch integer buffers. Verified against torch 2.13. Since the
+#          PS demands byte-for-byte reconstruction, that scalar must survive,
+#          which is why the SINT key kind and 8-byte width exist at all.
+#
+# Everything else safetensors defines (F8_*, U8/U16/U32/U64, I8/I16/I32,
+# BOOL, F64) is left out on purpose: no fixture or architecture in scope
+# produces one. `dtype_spec` raises on an unknown name rather than guessing,
+# so an unexpected dtype is a loud one-line fix, never silent corruption.
+#
+# Keyed on the *safetensors* name rather than a numpy dtype on purpose: numpy
+# has no bfloat16, so a BF16 tensor necessarily arrives here as uint16 and its
+# numpy dtype cannot be trusted to say what it is.
+_DTYPES: dict[str, Tuple[int, str]] = {
+    "F16": (2, FLOAT),
+    "BF16": (2, FLOAT),
+    "F32": (4, FLOAT),
+    "I64": (8, SINT),
+}
+
+_UINT_OF = {2: np.uint16, 4: np.uint32, 8: np.uint64}
+
+
+def dtype_spec(dtype: str) -> Tuple[int, str]:
+    """Map a safetensors dtype name to `(element_width_bytes, key_kind)`.
+
+    Raises ValueError for a name this codec does not know, rather than
+    guessing a width -- a wrong width silently produces a valid-looking but
+    incorrectly-keyed stream, which is the worst possible failure mode here.
+    """
+    try:
+        return _DTYPES[dtype]
+    except KeyError:
+        raise ValueError(
+            f"unsupported dtype {dtype!r}; known: {', '.join(sorted(_DTYPES))}"
+        ) from None
+
+
+# --------------------------------------------------------------------------
+# Step 1 -- bit pattern <-> monotone integer key (FORMAT.md section 8 step 1)
+# --------------------------------------------------------------------------
+#
+# All three key kinds are the same operation -- xor with a mask -- and differ
+# only in how the mask is derived. Writing it that way (rather than as three
+# separate branches, or as `np.where(is_neg, ~x, x ^ msb)`) matters for more
+# than tidiness: `np.where` evaluates *both* arms over the whole array, so it
+# allocates four temporaries per call on a multi-megabyte chunk. The masked
+# form is branchless and allocates two.
+
+
+def _mask_forward(bits: np.ndarray, kind: str, msb, zero, shift) -> np.ndarray:
+    if kind == SINT:
+        return msb
+    # FLOAT: sign set -> all-ones (a full complement); sign clear -> just the
+    # sign bit. `zero - (bits >> shift)` is 0 or all-ones without a compare.
+    return (zero - (bits >> shift)) | msb
+
+
+def _mask_inverse(key: np.ndarray, kind: str, msb, one, zero, shift) -> np.ndarray:
+    if kind == SINT:
+        return msb
+    # A key with its top bit *set* came from a non-negative float, so it needs
+    # only the sign bit flipped back; a key with it clear needs the full
+    # complement. That is the forward test inverted, hence the `^ one`.
+    return (zero - ((key >> shift) ^ one)) | msb
+
+
+def _consts(width: int):
+    u = _UINT_OF[width]
+    return u(0), u(1), u(1 << (width * 8 - 1)), u(width * 8 - 1)
+
+
+def to_monotone_key(bits: np.ndarray, kind: str) -> np.ndarray:
+    """Map raw bit patterns to keys whose unsigned ordering matches the
+    dtype's value ordering, so that a small change in value is a small change
+    in key -- which is the entire reason the delta in step 2 compresses.
+
+    Operates on the array's own width; `bits` must already be an unsigned
+    array of the right element width (see `_as_bits`).
+    """
+    zero, _one, msb, shift = _consts(bits.dtype.itemsize)
+    return bits ^ _mask_forward(bits, kind, msb, zero, shift)
+
+
+def from_monotone_key(key: np.ndarray, kind: str) -> np.ndarray:
+    """Exact inverse of `to_monotone_key`. Pinned by an exhaustive test over
+    every 8- and 16-bit pattern, for all three key kinds."""
+    zero, one, msb, shift = _consts(key.dtype.itemsize)
+    return key ^ _mask_inverse(key, kind, msb, one, zero, shift)
+
+
+# --------------------------------------------------------------------------
+# Steps 2-3 -- delta and zigzag (FORMAT.md section 8 steps 2-3)
+# --------------------------------------------------------------------------
+#
+# FORMAT.md says "delta = int32(key(B)) - int32(key(A))", widening 16-bit keys
+# into 32-bit deltas, and then hints at varint or bitpacking to win the space
+# back. Doing the arithmetic at the *native* width instead makes both the
+# widening and the bitpacking unnecessary:
+#
+#   - Subtraction mod 2**n is exact and reversible: (a - b) + b == a for every
+#     pair, wraparound included. Nothing is lost by not widening.
+#   - Zigzag over the full n-bit signed range is a bijection onto the n-bit
+#     unsigned range, so it needs no headroom either.
+#   - When |true delta| < 2**(n-1) -- the overwhelmingly common case, since
+#     aligned checkpoints differ slightly -- the wrapped value *is* the true
+#     delta, so the zigzagged output is just as small as it would have been.
+#     When it wraps, it aliases to the distance the short way around, which is
+#     never larger than the widened form would have been.
+#
+# So the residual stream is exactly the size of the tensor chunk rather than
+# double it, with no per-element Python work. `residual_ratio` is measured
+# against a stream that never inflates.
+
+
+def zigzag(delta: np.ndarray) -> np.ndarray:
+    """Interleave a two's-complement delta into an unsigned value so that
+    small-magnitude deltas of either sign become small unsigned integers --
+    which is what lets zstd see long runs of zero high bytes.
+
+    Stays at the input width; see the module note above.
+    """
+    zero, one, _msb, shift = _consts(delta.dtype.itemsize)
+    return (delta << one) ^ (zero - (delta >> shift))
+
+
+def unzigzag(zz: np.ndarray) -> np.ndarray:
+    """Exact inverse of `zigzag`."""
+    zero, one, _msb, _shift = _consts(zz.dtype.itemsize)
+    return (zz >> one) ^ (zero - (zz & one))
+
+
+# --------------------------------------------------------------------------
+# Chunk encode / decode
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EncodedChunk:
+    """One encoded chunk, ready for the pack writer.
+
+    Frozen and named rather than a bare tuple because the pack writer, the
+    manifest builder and the `commit --json` counters each want a different
+    subset, and positional unpacking made adding a field a breaking change.
+    """
+
+    encoding: str
+    """One of `raw`, `raw-zstd`, `delta-zigzag-zstd` (FORMAT.md section 7)."""
+
+    content_hash: bytes
+    """32-byte BLAKE3 of the *uncompressed* stream -- the chunk's identity for
+    dedup. Never covers compressed bytes (FORMAT.md section 2)."""
+
+    payload: bytes
+    """Exactly what gets written into the packfile."""
+
+    plain_len: int
+    """Length of the uncompressed stream that `content_hash` covers, which the
+    pack index needs in order to size the decode buffer."""
+
+    original_len: int
+    """True byte count of the tensor chunk this encodes -- the denominator for
+    `residual_ratio` (CLI.md section 3.1).
+
+    Currently always equal to `plain_len`, because the codec never inflates
+    (see the zigzag note above); `test_stream_never_inflates` exists to fail
+    loudly if a future encoding breaks that. They are kept as separate fields
+    so that callers reaching for a ratio denominator cannot accidentally pick
+    up a stream length that has started to diverge.
+    """
+
+    @property
+    def stored_len(self) -> int:
+        """Compressed size. Derived rather than stored, so it cannot drift out
+        of agreement with `payload`."""
+        return len(self.payload)
+
+
+def _as_bits(arr: np.ndarray, width: int, role: str) -> np.ndarray:
+    """Flatten `arr` to a contiguous 1-D unsigned view of `width`-byte elements.
+
+    The width check is doing real work: it is the guard against handing this
+    codec an array whose elements are not the size the declared dtype says.
+    Without it, a float32 array under a 16-bit assumption still round-trips
+    (the map is bijective on each half) but keys the mantissa halves as if
+    they were values, so the deltas are noise and compression collapses --
+    a silent 10x regression rather than an error. Because the check forces
+    `itemsize == width`, the `.view()` below never changes element size and so
+    can never raise on a non-divisible length either.
+    """
+    a = np.ascontiguousarray(arr)
+    if a.dtype.itemsize != width:
+        raise ValueError(
+            f"{role} chunk has {a.dtype.itemsize}-byte elements ({a.dtype}) but "
+            f"the declared dtype needs {width}-byte elements"
+        )
+    return a.view(_UINT_OF[width]).reshape(-1)
+
+
+def _finish(encoding: str, stream: bytes, payload: bytes, original_len: int) -> EncodedChunk:
+    return EncodedChunk(
+        encoding=encoding,
+        content_hash=blake3.blake3(stream).digest(),
+        payload=payload,
+        plain_len=len(stream),
+        original_len=original_len,
+    )
+
+
+def encode_chunk(
+    target: np.ndarray,
+    base: Optional[np.ndarray] = None,
+    *,
+    dtype: str,
+    compressor: Optional[zstd.ZstdCompressor] = None,
+    level: int = DEFAULT_LEVEL,
+    compress_raw: bool = True,
+    allow_raw_fallback: bool = True,
+) -> EncodedChunk:
+    """Encode one chunk, against `base` if given.
+
+    Args:
+        target: The chunk to encode. Any numpy array whose element width
+            matches `dtype`; its bytes are what matter, not its numpy dtype.
+        base: The corresponding chunk of the base checkpoint, already gathered
+            through whatever permutation applies. `None` means there is no
+            base (root commit, or a tensor absent from the base checkpoint),
+            which is a normal condition, not an error.
+        dtype: safetensors dtype name (`"F16"`, `"BF16"`, `"F32"`, ...). This
+            is what fixes the element width and key kind; it is required
+            because a BF16 chunk is indistinguishable from a U16 one by
+            inspection.
+        compressor: Reuse an existing compressor if you have one. Constructing
+            one costs ~1 us against a ~5 ms compress of a 4 MiB chunk, so
+            leaving this `None` is not a measurable cost -- and a per-call
+            compressor is trivially safe to use from several threads, which a
+            shared one is not.
+        level: zstd level used when `compressor` is None.
+        compress_raw: When False, a base-less chunk is stored as `raw`
+            (uncompressed) instead of `raw-zstd`. Exposed as a flag rather
+            than hardcoded because FORMAT.md section 7 leaves the root-chunk
+            encoding open: `raw` keeps a permuted gather a page-cache memcpy,
+            `raw-zstd` saves disk. Benchmark, then set a default.
+        allow_raw_fallback: Also encode the chunk raw and keep whichever is
+            smaller (FORMAT.md section 7: "per-chunk when delta doesn't help").
+            Costs a second compression pass, so it is a flag.
+
+    Returns:
+        An `EncodedChunk`.
+
+    Raises:
+        ValueError: unknown `dtype`, element width disagreeing with `dtype`,
+            or `target` and `base` differing in shape.
+    """
+    width, kind = dtype_spec(dtype)
+    t_bits = _as_bits(target, width, "target")
+    original_len = t_bits.nbytes
+
+    if compressor is None:
+        compressor = zstd.ZstdCompressor(level=level)
+
+    def encode_raw() -> EncodedChunk:
+        stream = t_bits.tobytes()
+        if compress_raw:
+            return _finish(RAW_ZSTD, stream, compressor.compress(stream), original_len)
+        return _finish(RAW, stream, stream, original_len)
+
+    if base is None:
+        return encode_raw()
+
+    # Compared before flattening: once both are 1-D, a (4, 8) base against an
+    # (8, 4) target has the same element count and would encode "successfully"
+    # into a residual that reconstructs transposed garbage. That is exactly the
+    # shape of bug a permutation implementation introduces.
+    if np.shape(target) != np.shape(base):
+        raise ValueError(
+            f"chunk shape mismatch: target {np.shape(target)} vs base {np.shape(base)}"
+        )
+    b_bits = _as_bits(base, width, "base")
+
+    delta = to_monotone_key(t_bits, kind) - to_monotone_key(b_bits, kind)
+    stream = zigzag(delta).tobytes()
+    encoded = _finish(DELTA, stream, compressor.compress(stream), original_len)
+
+    if allow_raw_fallback:
+        alternative = encode_raw()
+        if alternative.stored_len < encoded.stored_len:
+            # Note this also changes the chunk's identity to the hash of its
+            # raw content, which is the desirable outcome: a chunk stored raw
+            # dedups against every other identical raw chunk in the repo,
+            # whereas a residual is only ever identical to a residual taken
+            # against the same base.
+            return alternative
+    return encoded
+
+
+def decode_chunk(
+    encoding: str,
+    payload: bytes,
+    base: Optional[np.ndarray] = None,
+    *,
+    dtype: str,
+    decompressor: Optional[zstd.ZstdDecompressor] = None,
+) -> np.ndarray:
+    """Reconstruct a chunk's raw bit patterns. Exact inverse of `encode_chunk`.
+
+    Returns a flat unsigned array of `width`-byte elements -- bit patterns, not
+    decoded values. That is deliberate and not a convenience shortcut: there is
+    no numpy dtype for bf16, so "return the real dtype" is not a contract this
+    function could honour for every input. Reshaping and reinterpreting is the
+    caller's job, using the shape and dtype from the tensor manifest.
+
+    For `raw` the result is a zero-copy read-only view straight onto `payload`,
+    which is the point of that encoding for the FUSE read path. The other two
+    encodings return freshly-allocated arrays. Copy if you need to write.
+
+    Raises:
+        ValueError: unknown `encoding`, a `delta-zigzag-zstd` chunk with no
+            `base`, or a base whose element count disagrees with the residual.
+    """
+    width, kind = dtype_spec(dtype)
+    unsigned = _UINT_OF[width]
+
+    if encoding == RAW:
+        stream = payload
+    elif encoding in (RAW_ZSTD, DELTA):
+        if decompressor is None:
+            decompressor = zstd.ZstdDecompressor()
+        stream = decompressor.decompress(payload)
+    else:
+        raise ValueError(
+            f"unknown chunk encoding {encoding!r}; expected one of "
+            f"{RAW!r}, {RAW_ZSTD!r}, {DELTA!r}"
+        )
+
+    if encoding in (RAW, RAW_ZSTD):
+        return np.frombuffer(stream, dtype=unsigned)
+
+    if base is None:
+        raise ValueError(f"{DELTA} chunk cannot be decoded without a base chunk")
+    b_bits = _as_bits(base, width, "base")
+
+    zz = np.frombuffer(stream, dtype=unsigned)
+    if zz.size != b_bits.size:
+        raise ValueError(
+            f"residual has {zz.size} elements but base chunk has {b_bits.size}"
+        )
+
+    target_key = to_monotone_key(b_bits, kind) + unzigzag(zz)
+    return from_monotone_key(target_key, kind)

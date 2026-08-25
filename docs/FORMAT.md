@@ -414,38 +414,71 @@ through `base_row_permutation`, and column-permuted through `base_col_permutatio
 `col_block_size`):
 
 **1. Bit-pattern → monotone integer key.** Per element, on raw bit patterns, never on
-decoded float values. For a 16-bit dtype (fp16 and bf16 both):
+decoded float values. The map depends on how the dtype lays out its sign, not on how
+wide it is, so width and *key kind* are chosen separately. For an `n`-bit element, with
+`MSB = 1 << (n-1)`:
 
-```
-key(x) = bits(x) ^ 0x8000        if sign bit clear
-key(x) = ~bits(x)  (uint16)      if sign bit set
-```
+| Key kind | dtypes | `key(x)` |
+|---|---|---|
+| float (sign-magnitude) | `F16` `BF16` `F32` `F64` `F8_*` | `bits ^ MSB` if sign clear; `~bits` if sign set |
+| sint (two's complement) | `I8` `I16` `I32` `I64` | `bits ^ MSB` |
+| uint (already ordered) | `U8` `U16` `U32` `U64` `BOOL` | `bits` |
 
 Order-preserving over the value domain, so numerically small changes produce small
-integer deltas. Generalizes to width `w` as `1 << (w-1)`.
+integer deltas. All three are xor with a mask, which is why the implementation is
+branchless rather than three cases.
 
-> Two correctness notes worth knowing before someone "fixes" this:
+> Three correctness notes worth knowing before someone "fixes" this:
 > - **NaN and Inf need no special case.** They are bit patterns like any other and
 >   round-trip exactly, because nothing in this path interprets them as numbers.
 > - **`-0.0` and `+0.0` must stay distinct.** `bits(-0.0) = 0x8000 → key 0x7FFF`;
 >   `bits(+0.0) = 0x0000 → key 0x8000`. Any "normalization" of signed zero breaks
 >   byte-exactness. Do not add one.
+> - **The key kind is not inferable from the array.** numpy has no `bfloat16`, so a
+>   BF16 chunk necessarily arrives as `uint16` and is indistinguishable from a real
+>   U16 chunk by inspection. The safetensors dtype name must be passed in explicitly;
+>   keying a BF16 tensor as `uint` still round-trips and silently destroys the ratio.
 
-**2. Delta.** `delta = int32(key(B)) - int32(key(A))`, element-wise. int32 is always
-sufficient for 16-bit keys (max magnitude 65535).
+**2. Delta.** `delta = key(B) - key(A)`, element-wise, **at the native element width**,
+wrapping mod `2**n`. Do not widen.
 
-**3. Zigzag + bitpack.** `zz(n) = (n << 1) ^ (n >> 31)`, then varint or bitpack.
+Wrapping loses nothing: `(a - b) + b == a` mod `2**n` for every pair, wraparound
+included, so reconstruction stays exact. When `|true delta| < 2**(n-1)` — the
+overwhelmingly common case, since aligned checkpoints differ slightly — the wrapped
+value *is* the true delta. When it wraps, it aliases to the distance the short way
+around, which is never larger than a widened delta would have been.
+
+**3. Zigzag.** `zz(d) = (d << 1) ^ (d >> (n-1))`, also at native width — over the full
+`n`-bit signed range this is a bijection onto the full `n`-bit unsigned range, so it
+needs no headroom either.
 **The output of this step is what the chunk's content hash covers** (§2).
+
+> **No varint, no bitpacking.** An earlier draft of this section widened 16-bit keys to
+> `int32` and then proposed varint or bitpack to win the doubled stream back. Steps 2–3
+> at native width make both unnecessary: the residual stream is *exactly* the size of
+> the tensor chunk it encodes, with no per-element work, and zstd in step 4 takes it
+> from there. `residual_ratio` is therefore measured against a stream that never
+> inflates. Reintroducing widening silently doubles `plain_len`;
+> `test_stream_never_inflates` exists to catch that.
 
 **4. Compress.** zstd, optionally with the pack's dictionary (§6). This produces the
 record payload.
 
-**Reconstruction** reverses each step exactly: decompress → un-zigzag →
-`key(B) = delta + key(A)` → invert `key()` → reinterpret as the dtype. Every step is
-integer arithmetic on raw bit patterns; no float rounding occurs anywhere, which is
-what makes byte-exact reconstruction unconditional rather than "usually exact."
+**Reconstruction** reverses each step exactly: decompress → un-zigzag
+(`d = (zz >> 1) ^ -(zz & 1)`) → `key(B) = delta + key(A)` (native width, wrapping) →
+invert `key()` → reinterpret as the dtype. Every step is integer arithmetic on raw bit
+patterns; no float rounding occurs anywhere, which is what makes byte-exact
+reconstruction unconditional rather than "usually exact."
 
-`raw` and `raw-zstd` chunks skip steps 1–3 entirely.
+`raw` and `raw-zstd` chunks skip steps 1–3 entirely. A chunk that *was* delta-encoded
+but compressed worse than raw is stored `raw-zstd` instead (§7); note this also changes
+its content hash to the hash of its raw content, which is the desirable outcome — a raw
+chunk dedups against every identical raw chunk in the repo, whereas a residual only
+ever matches a residual taken against the same base.
+
+Implemented in `synapsefs/codec/chunk.py`; every claim above is pinned by a test in
+`tests/test_codec_chunk.py`, including exhaustive round-trips over all 8- and 16-bit
+patterns for all three key kinds.
 
 ### 8.1 Pack dictionary
 
@@ -550,12 +583,59 @@ should simply be the default.
 
 ---
 
+## 12A. Re-basing interval (delta-chain depth)
+
+**Decision: every 4th commit in a chain is stored in full, not as a diff.**
+
+A commit whose base is itself a diff can only be reconstructed by reconstructing its
+base first, recursively, down to a full checkpoint. Committing epoch 50 against epoch 49
+with no baselines means walking 49 residuals to read a single tensor row — and both
+`commit` and `checkout` wall-clock are graded.
+
+So a chain looks like:
+
+```
+commit  1     2     3     4     5     6     7     8
+stored  FULL  diff  diff  diff  FULL  diff  diff  diff
+depth   0     1     2     3     0     1     2     3
+```
+
+A full commit stores every tensor with `base_tensor_manifest: null` and all chunks
+`raw`/`raw-zstd` — structurally identical to a root commit (§7.2), so no new code path
+is needed to write one and none is needed to read one. Reconstruction depth is bounded
+at 3 regardless of history length.
+
+Note this costs less disk than it appears to. A full commit's chunks are still
+content-addressed and deduped against every pack already in the repo (§6.3), so tensors
+that did not change between the diff commits and the new baseline are not re-stored —
+only their manifest entries are rewritten. The cost is bounded by what actually changed
+since the last baseline, not by checkpoint size.
+
+`N = 4` is a placeholder chosen for bounded worst-case reconstruction, not a measured
+optimum. It is deliberately a constant in one place so it can be swapped.
+
+**Planned successor: make the interval dynamic.** Rather than a fixed count, force a
+baseline when consecutive commits become sufficiently *incompatible* — i.e. when the
+residual stops being cheap, which is the same signal §9's not-alignable check already
+computes. A commit whose residual ratio jumps, or whose tensors increasingly fall back
+to `raw-zstd` per §7, is one where the chain has stopped paying for itself and a fresh
+baseline is cheaper than a long walk of expensive diffs. That turns re-basing from a
+schedule into a response to the data, and reuses a measurement the alignment stage
+already has to make.
+
+`OPEN QUESTION` — the dynamic trigger's exact statistic and threshold. Blocked on the
+same measurements as §9's not-alignable threshold; until then the fixed N = 4 stands.
+
+---
+
 ## 13. Open questions to resolve before Phase 1 is "done"
 
 - [ ] Default chunk size / rows-per-chunk (needs the codec benchmark, PLAN §1.2).
 - [ ] Root-checkpoint encoding: `raw` vs `raw-zstd` (gather cost vs. 24 GB free disk).
 - [ ] Pack dictionary on/off, and dictionary size, measured on real fixtures.
-- [ ] Re-basing interval N for delta-chain depth.
+- [x] Re-basing interval N for delta-chain depth — **fixed N = 4** (§12A).
+- [ ] Dynamic re-basing trigger to replace the fixed N (§12A), keyed on
+      residual-ratio degradation / `raw-zstd` fallback rate.
 - [ ] Not-alignable threshold, measured against the non-alignable fixture.
 - [ ] Repack trigger / bloom filters if pack count exceeds ~32.
 - [ ] Whether `verify --deep` becomes the default.

@@ -31,3 +31,6 @@ include = ["synapsefs*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "slow: exercises a real subprocess kill (SIGKILL) -- correct but slower; skip with -m \"not slow\"",
+]

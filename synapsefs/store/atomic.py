@@ -43,7 +43,9 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from typing import IO, Iterator
 
 
 def _fsync_dir(dir_path: Path) -> None:
@@ -108,6 +110,34 @@ def atomic_write(target_path: Path, data: bytes, *, tmp_dir: Path) -> None:
         re-raising, so a failed attempt never leaves debris in
         `objects/tmp/` for the next startup GC to have to clean up.
     """
+    with atomic_writer(target_path, tmp_dir=tmp_dir) as f:
+        f.write(data)
+
+
+@contextmanager
+def atomic_writer(target_path: Path, *, tmp_dir: Path) -> Iterator[IO[bytes]]:
+    """Streaming form of `atomic_write`: yields a writable binary file object
+    whose contents land at `target_path` atomically when the block exits.
+
+    Same four-step guarantee and the same crash semantics as `atomic_write`
+    above -- this is where those steps actually live now, and `atomic_write`
+    is a two-line wrapper over it, so the "exactly one safe-write path in the
+    codebase" claim in this module's docstring stays true.
+
+    It exists because `atomic_write` takes `bytes`, which means holding the
+    entire payload in memory. That is right for a ref or a loose object, and
+    wrong for a packfile: those are sized by the checkpoint that produced
+    them, and the PS grades peak RSS. A pack writer needs to append records
+    as they arrive and never hold more than one.
+
+    The yielded object is a real file, so `seek()` and `tell()` work -- the
+    pack writer needs both, because a pack's header contains a record count
+    it cannot know until every record has been written.
+
+    Nothing is visible at `target_path` until the block exits normally. If
+    the block raises, the temp file is removed and the exception propagates,
+    leaving `target_path` untouched.
+    """
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / f"{uuid.uuid4().hex}.tmp"
 
@@ -115,10 +145,13 @@ def atomic_write(target_path: Path, data: bytes, *, tmp_dir: Path) -> None:
     # someone else's in-flight write. With random uuid4 names this should
     # never actually trigger in practice -- it's a correctness assertion,
     # not defensive noise for a realistic scenario.
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    # O_RDWR, not O_WRONLY: a caller that has to patch a header and then
+    # hash the finished file (the pack writer does both) needs to read its
+    # own output back without reopening it by path.
+    fd = os.open(str(tmp_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
+        with os.fdopen(fd, "w+b") as f:
+            yield f
             f.flush()
             os.fsync(f.fileno())
     except BaseException:

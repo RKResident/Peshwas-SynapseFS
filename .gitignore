@@ -6,6 +6,7 @@ fixtures/
 *.safetensors
 *.pt
 *.bin
+personal_testing/
 
 # --- Repositories created during manual testing ------------------------------
 .synapse/

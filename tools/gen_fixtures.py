@@ -41,7 +41,7 @@ Self-verification
 Applying a permutation correctly is itself fiddly: a row permutation on layer
 ``l`` must be matched by a column permutation on layer ``l+1``, biases and
 normalisation parameters follow the row permutation, residual connections force
-two layers to *share* a permutation group, and a conv-to-linear flatten permutes
+two (what if skip more than 2?) layers to *share* a permutation group, and a conv-to-linear flatten permutes
 *blocks* of columns rather than individual columns. Get any of that wrong and the
 generator emits a model that is not functionally equivalent to its base — at
 which point the aligner faithfully recovers nonsense and every test still passes.

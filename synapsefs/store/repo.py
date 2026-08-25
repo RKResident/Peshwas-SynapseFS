@@ -11,13 +11,44 @@ model even though writing them safely uses the exact same primitive.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 from synapsefs.errors import NoRepoError, UsageError
 from synapsefs.store.atomic import atomic_write
 from synapsefs.store.objectstore import ObjectStore
 
 SYNAPSE_DIRNAME = ".synapse"
+_HEAD_REF_PREFIX = "ref: "
+_REFS_HEADS_PREFIX = "refs/heads/"
+_HEX_DIGITS = frozenset("0123456789abcdef")
+_MIN_ABBREV_HASH_LEN = 6
+_FULL_HASH_LEN = 64
+
+
+def _is_valid_branch_name(name: str) -> bool:
+    """Structural validity for a branch name used as a path component under
+    `refs/heads/<name>` -- says nothing about whether that branch actually
+    exists.
+
+    A branch name becomes a filesystem path, so this is a path-traversal
+    guard (reject `..`, `/`, a leading `-` that argparse-adjacent tooling
+    could mistake for a flag, and the empty string), not cosmetics.
+    """
+    if not name:
+        return False
+    if name.startswith("-"):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    if ".." in name:
+        return False
+    return True
+
+
+def _validate_branch_name(name: str) -> None:
+    """Raise UsageError unless `name` is safe to use under `refs/heads/`."""
+    if not _is_valid_branch_name(name):
+        raise UsageError(f"invalid branch name: {name!r}")
 
 
 class Repo:
@@ -64,8 +95,20 @@ class Repo:
         not a second, bespoke implementation -- so there is exactly one
         write path to trust and test.
 
-        Raises UsageError (CLI.md exit 2) if `.synapse/` already exists.
+        Raises UsageError (CLI.md exit 2) if `.synapse/` already exists, or if
+        `branch` is not a valid branch name.
+
+        `branch` is validated up front, *before* any directory is created.
+        `set_head_branch` below validates it too, but relying on that alone
+        would be a trap: a rejected `--branch` would abort after the mkdirs
+        had already run, leaving a `.synapse/` that has every directory and
+        no HEAD -- and every retry would then hit the "already exists" check
+        above and refuse, so a single typo would wedge the directory until
+        someone deleted `.synapse/` by hand. Validating first makes a bad
+        branch name a total no-op on disk.
         """
+        _validate_branch_name(branch)
+
         root = Path(path).resolve()
         synapse_dir = root / SYNAPSE_DIRNAME
         if synapse_dir.exists():
@@ -77,14 +120,9 @@ class Repo:
         tmp_dir.mkdir(parents=True, exist_ok=True)
         (synapse_dir / "refs" / "heads").mkdir(parents=True)
 
-        head_path = synapse_dir / "HEAD"
-        atomic_write(
-            head_path,
-            f"ref: refs/heads/{branch}\n".encode("utf-8"),
-            tmp_dir=tmp_dir,
-        )
-
-        return cls(root)
+        repo = cls(root)
+        repo.set_head_branch(branch)
+        return repo
 
     @classmethod
     def find(cls, start: Union[str, Path] = ".") -> "Repo":
@@ -104,3 +142,142 @@ class Repo:
                     f"not a synapsefs repository (or any parent up to /): {start}"
                 )
             current = current.parent
+
+    def read_head(self) -> Tuple[Optional[str], Optional[str]]:
+        """Parse HEAD and resolve it one level, returning `(branch, commit_hash)`.
+
+        Three cases, matching HEAD's two on-disk shapes:
+
+        - Attached HEAD (`ref: refs/heads/<name>\\n`) whose branch ref file
+          doesn't exist yet -- "unborn", the state right after `init` before
+          any commit lands: `(name, None)`.
+        - Attached HEAD whose branch ref file exists: `(name, hash)`.
+        - Detached HEAD (HEAD itself holds a raw hex hash, no `ref:` line):
+          `(None, hash)`.
+
+        Callers are expected to already hold a `Repo` from `find()` or
+        `init_at()`, both of which guarantee HEAD exists -- a missing HEAD
+        here means a corrupted `.synapse/` dir, not a normal condition, so
+        it's left to surface as a plain FileNotFoundError rather than
+        papered over with a third typed case.
+        """
+        text = self.head_path.read_text(encoding="utf-8").strip()
+        if text.startswith(_HEAD_REF_PREFIX):
+            ref = text[len(_HEAD_REF_PREFIX):].strip()
+            branch = (
+                ref[len(_REFS_HEADS_PREFIX):]
+                if ref.startswith(_REFS_HEADS_PREFIX)
+                else ref
+            )
+            ref_path = self.refs_heads_dir / branch
+            if ref_path.is_file():
+                return branch, ref_path.read_text(encoding="utf-8").strip()
+            return branch, None
+        # No "ref: " prefix -- detached HEAD, the text itself is the hash.
+        return None, text
+
+    def _lookup_hash(self, ref: str) -> str:
+        """Resolve a full or abbreviated hex hash to the full hash stored
+        under `objects/<hh>/<hash>`.
+
+        Raises UsageError if nothing matches (unknown ref) or more than one
+        object matches an abbreviated prefix (ambiguous ref, per CLI.md
+        ~1.4's "must be unambiguous").
+        """
+        lowered = ref.lower()
+        if len(lowered) == _FULL_HASH_LEN:
+            if not (self.objects_dir / lowered[:2] / lowered).is_file():
+                raise UsageError(f"unknown ref: {ref!r} (no such object)")
+            return lowered
+
+        shard = self.objects_dir / lowered[:2]
+        matches = (
+            [p.name for p in shard.iterdir() if p.is_file() and p.name.startswith(lowered)]
+            if shard.is_dir()
+            else []
+        )
+        if not matches:
+            raise UsageError(f"unknown ref: {ref!r} (no object matches this prefix)")
+        if len(matches) > 1:
+            raise UsageError(
+                f"ambiguous ref: {ref!r} matches {len(matches)} objects, "
+                f"need more characters"
+            )
+        return matches[0]
+
+    def resolve_ref(self, ref: str) -> Optional[str]:
+        """Resolve `ref` (CLI.md ~1.4) to a commit hash.
+
+        Accepts `"HEAD"`, a branch name, or a full/abbreviated (>= 6 chars)
+        hex commit hash, in that priority order -- a branch that happens to
+        be named like a hex string still resolves as a branch first, mirroring
+        real git's resolution order for an ambiguous name.
+
+        Returns the resolved commit hash, or `None` if `ref` is `"HEAD"` and
+        HEAD is unborn (no commit reachable from it yet) -- that is the one
+        case where "doesn't exist" is legitimate rather than an error, per
+        CLI.md ~3's "`--base` ... Ignored on the root commit."
+
+        Raises UsageError if `ref` is malformed, names a branch that doesn't
+        exist, or is an unknown/ambiguous hash.
+        """
+        if not ref:
+            raise UsageError("empty ref")
+
+        if ref == "HEAD":
+            _, commit_hash = self.read_head()
+            return commit_hash
+
+        if _is_valid_branch_name(ref):
+            branch_path = self.refs_heads_dir / ref
+            if branch_path.is_file():
+                return branch_path.read_text(encoding="utf-8").strip()
+
+        lowered = ref.lower()
+        looks_like_hash = (
+            _MIN_ABBREV_HASH_LEN <= len(lowered) <= _FULL_HASH_LEN
+            and all(c in _HEX_DIGITS for c in lowered)
+        )
+        if looks_like_hash:
+            return self._lookup_hash(lowered)
+
+        raise UsageError(f"unknown ref: {ref!r}")
+
+    def update_ref(self, branch: str, commit_hash: str) -> None:
+        """Atomically point `refs/heads/<branch>` at `commit_hash`.
+
+        The single write path `commit`, `merge`, and (fast-forward)
+        `checkout` all funnel through to advance a branch -- written once
+        here rather than inlined per-command, same reasoning as
+        `set_head_branch` below. Goes through `atomic_write` like every
+        other durable write in this codebase; a torn ref file would be at
+        least as bad as a torn object.
+
+        Raises UsageError if `branch` isn't a safe `refs/heads/` path
+        component (see `_is_valid_branch_name`).
+        """
+        _validate_branch_name(branch)
+        target = self.refs_heads_dir / branch
+        atomic_write(
+            target,
+            f"{commit_hash}\n".encode("utf-8"),
+            tmp_dir=self.objects_dir / "tmp",
+        )
+
+    def set_head_branch(self, branch: str) -> None:
+        """Atomically attach HEAD to `refs/heads/<branch>`.
+
+        Writes `ref: refs/heads/<branch>\\n` through `atomic_write`, exactly
+        as `init_at` used to inline -- this is now the one HEAD-writing path,
+        used by both `init_at` (initial attach) and `checkout <branch>`
+        (switching branches, CLI.md ~4).
+
+        Raises UsageError if `branch` isn't a safe `refs/heads/` path
+        component (see `_is_valid_branch_name`).
+        """
+        _validate_branch_name(branch)
+        atomic_write(
+            self.head_path,
+            f"ref: refs/heads/{branch}\n".encode("utf-8"),
+            tmp_dir=self.objects_dir / "tmp",
+        )

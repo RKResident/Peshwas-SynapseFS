@@ -92,3 +92,4 @@ class ObjectStore:
             return path.read_bytes()
         except FileNotFoundError as exc:
             raise ObjectNotFoundError(object_hash) from exc
+
