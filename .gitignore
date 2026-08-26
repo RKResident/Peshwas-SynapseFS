@@ -1,5 +1,5 @@
-team_dst/
-team_src/
+test_src/
+test_dst/
 spp
 tcp_test
 
