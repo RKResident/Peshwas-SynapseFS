@@ -1,7 +1,0 @@
-{
-  "header_object": "123456789037qwertyuioplkjhgfdsazxcvbnmMNBVCXZASDFGHJKLPOIUTEWQ",
-  "tensors": {
-    "layer1": "678907654321qwertyuiopasdfghjklzxcvbnmQWERYIOPlkjhgfdsazxcvbnm",
-  },
-  "topology_config_hash": "<blake3 of the config.json this checkpoint was aligned against>"
-}
