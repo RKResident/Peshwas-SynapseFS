@@ -583,48 +583,86 @@ should simply be the default.
 
 ---
 
-## 12A. Re-basing interval (delta-chain depth)
+## 12A. Commit topology: a star, not a chain
 
-**Decision: every 4th commit in a chain is stored in full, not as a diff.**
-
-A commit whose base is itself a diff can only be reconstructed by reconstructing its
-base first, recursively, down to a full checkpoint. Committing epoch 50 against epoch 49
-with no baselines means walking 49 residuals to read a single tensor row — and both
-`commit` and `checkout` wall-clock are graded.
-
-So a chain looks like:
+**Decision: every residual commit diffs directly against its group's full
+checkpoint, and every 4th commit becomes a new full checkpoint.**
 
 ```
-commit  1     2     3     4     5     6     7     8
-stored  FULL  diff  diff  diff  FULL  diff  diff  diff
-depth   0     1     2     3     0     1     2     3
+commit   1     2     3     4     5     6     7     8
+stored   FULL  diff  diff  diff  FULL  diff  diff  diff
+base     --    1     1     1     --    5     5     5
 ```
 
-A full commit stores every tensor with `base_tensor_manifest: null` and all chunks
-`raw`/`raw-zstd` — structurally identical to a root commit (§7.2), so no new code path
-is needed to write one and none is needed to read one. Reconstruction depth is bounded
-at 3 regardless of history length.
+Contrast the chain this replaced, where commit 4's base was commit 3, whose base
+was commit 2. Both bound the damage with the same `N`, but they bound different
+things:
 
-Note this costs less disk than it appears to. A full commit's chunks are still
-content-addressed and deduped against every pack already in the repo (§6.3), so tensors
-that did not change between the diff commits and the new baseline are not re-stored —
-only their manifest entries are rewritten. The cost is bounded by what actually changed
-since the last baseline, not by checkpoint size.
+| | chain | star |
+|---|---|---|
+| decodes to reconstruct the Nth commit | N | **2**, always |
+| what `N` limits | reconstruction depth | how far a group drifts from its hub |
+| residual size | smallest possible | grows with distance from the hub |
 
-`N = 4` is a placeholder chosen for bounded worst-case reconstruction, not a measured
-optimum. It is deliberately a constant in one place so it can be swapped.
+### Why the star wins
 
-**Planned successor: make the interval dynamic.** Rather than a fixed count, force a
-baseline when consecutive commits become sufficiently *incompatible* — i.e. when the
-residual stops being cheap, which is the same signal §9's not-alignable check already
-computes. A commit whose residual ratio jumps, or whose tensors increasingly fall back
-to `raw-zstd` per §7, is one where the chain has stopped paying for itself and a fresh
-baseline is cheaper than a long walk of expensive diffs. That turns re-basing from a
-schedule into a response to the data, and reuses a measurement the alignment stage
-already has to make.
+Measured at depth 3 on a 512x512 fp16 tensor, across a synthetic fine-tune run:
 
-`OPEN QUESTION` — the dynamic trigger's exact statistic and threshold. Blocked on the
-same measurements as §9's not-alignable threshold; until then the fixed N = 4 stands.
+| drift | star storage vs chain | reconstruct depth-3 |
+|---|---|---|
+| frozen | 1.00x | chain 2.33 ms / star 1.06 ms (**2.19x**) |
+| tiny LR | 1.16x | |
+| typical fine-tune | 1.09x | |
+| aggressive | 1.05x | |
+| near-retrain | 1.03x | |
+
+Three things make that trade worth taking:
+
+1. **The storage penalty shrinks exactly where it would hurt.** The star costs
+   most when drift is tiny (1.16x) -- but that is when residuals are small in
+   absolute terms, so it is 16% of a small number. Once residuals are large, the
+   delta is dominated by real change rather than by distance, and the two
+   converge to within 3-5%.
+2. **The graded weights point this way.** `residual_ratio` is 7%. Reconstruction
+   speed feeds `mmap read throughput` (8%), `POSIX compliance` (10%) and
+   `daemon peak RSS` (7%) -- and chain depth multiplies RSS too, since each
+   level holds a decoded array live while decoding the next.
+3. **Partial reads are the real workload.** The 2.19x above is whole-tensor
+   reconstruction. A 4 KB FUSE read of one row range under a chain pulls chunks
+   at *every* level; under a star it pulls two. The gap there is wider.
+
+### Consequences to be aware of
+
+- **`N` is still needed.** It now bounds the star's radius rather than a chain's
+  depth: without it, a long run drifts arbitrarily far from its hub and the
+  residuals grow without limit. The reset is visible in practice -- residual
+  ratio climbing 18.8% -> 20.6% -> 21.5% across a group, then dropping back at
+  the next anchor.
+- **The hub is load-bearing.** Every commit in a group depends on it, so losing
+  a hub's pack costs the whole group rather than a suffix. Content addressing
+  and `verify` detect that; they do not repair it.
+- **A full commit is structurally identical to a root commit** -- every tensor
+  `base_tensor_manifest: null`, all chunks `raw`/`raw-zstd` -- so no separate
+  code path exists to write or read one.
+- **A full commit costs far less than a whole checkpoint.** Its chunks are still
+  content-addressed and deduped against every existing pack (section 6.3), and
+  unchanged tensors reuse their manifests outright (section 4.5), so the cost is
+  bounded by what actually changed since the last hub.
+
+`N = 4` is a placeholder chosen for a bounded worst case, not a measured optimum.
+It lives in exactly one place, `graph.REBASE_INTERVAL`.
+
+**Planned successor: make the interval dynamic.** Rather than a fixed count,
+start a new hub when the group's residuals stop being cheap -- the same signal
+section 9's not-alignable check already computes. A commit whose residual ratio
+jumps, or whose tensors increasingly fall back to `raw-zstd` per section 7, is
+one where the group has drifted far enough that a fresh hub is cheaper than a
+larger residual. That turns re-basing from a schedule into a response to the
+data, and reuses a measurement the alignment stage has to make anyway.
+
+`OPEN QUESTION` -- the dynamic trigger's exact statistic and threshold. Blocked
+on the same measurements as section 9's not-alignable threshold; until then the
+fixed `N = 4` stands.
 
 ---
 
@@ -633,7 +671,7 @@ same measurements as §9's not-alignable threshold; until then the fixed N = 4 s
 - [ ] Default chunk size / rows-per-chunk (needs the codec benchmark, PLAN §1.2).
 - [ ] Root-checkpoint encoding: `raw` vs `raw-zstd` (gather cost vs. 24 GB free disk).
 - [ ] Pack dictionary on/off, and dictionary size, measured on real fixtures.
-- [x] Re-basing interval N for delta-chain depth — **fixed N = 4** (§12A).
+- [x] Commit topology and re-basing interval — **star, fixed N = 4** (§12A).
 - [ ] Dynamic re-basing trigger to replace the fixed N (§12A), keyed on
       residual-ratio degradation / `raw-zstd` fallback rate.
 - [ ] Not-alignable threshold, measured against the non-alignable fixture.

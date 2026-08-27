@@ -8,9 +8,17 @@ fixtures/
 *.bin
 personal_testing/
 
+# Downloaded datasets and training output from tools/train_stl10.py. The STL-10
+# archive alone is ~2.5 GB (it bundles 100k unlabeled images), so this is the
+# difference between a clone and an accident.
+data/
+checkpoints/
+
 # --- Repositories created during manual testing ------------------------------
 .synapse/
 *.synapse/
+tools/checkpoints
+tools/data
 
 # --- Benchmark output --------------------------------------------------------
 bench-results/

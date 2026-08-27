@@ -72,17 +72,61 @@ def test_overwrite_replaces_wholesale(tmp_path: Path):
 
 def test_stale_tmp_file_is_gc_able(tmp_path: Path):
     """Simulates the aftermath of a crash: a file left in objects/tmp/ that
-    never got renamed out. gc_tmp_dir must remove it unconditionally --
-    nothing in tmp/ is ever a real, addressable object."""
+    never got renamed out. Once it is old enough to be unambiguously
+    abandoned, gc_tmp_dir must remove it -- nothing in tmp/ is ever a real,
+    addressable object.
+
+    `min_age_seconds=0` stands in for "this file is old", so the test does not
+    have to fake an mtime 15 minutes in the past.
+    """
     tmp_dir = tmp_path / "objects" / "tmp"
     tmp_dir.mkdir(parents=True)
     stray = tmp_dir / "leftover.tmp"
     stray.write_bytes(b"\x00" * 10)  # stands in for a torn/incomplete write
 
-    removed = gc_tmp_dir(tmp_dir)
+    removed = gc_tmp_dir(tmp_dir, min_age_seconds=0)
 
     assert removed == 1
     assert not stray.exists()
+
+
+def test_gc_leaves_in_flight_writes_alone(tmp_path: Path):
+    """The age gate. A freshly-created temp file belongs to a write that is
+    probably still running, and deleting it makes that writer die at
+    os.rename.
+
+    This is not hypothetical: `ObjectStore.__init__` calls `gc_tmp_dir`, so
+    any second process starting up -- a `mount`, a `log` -- used to destroy an
+    in-flight commit. Packfiles made it acute, because a pack stages for as
+    long as it takes to encode a whole checkpoint rather than for
+    microseconds.
+    """
+    tmp_dir = tmp_path / "objects" / "tmp"
+    tmp_dir.mkdir(parents=True)
+    in_flight = tmp_dir / "someone-elses-write.tmp"
+    in_flight.write_bytes(b"partial")
+
+    assert gc_tmp_dir(tmp_dir) == 0
+    assert in_flight.exists()
+
+
+def test_a_concurrent_store_open_does_not_break_an_in_flight_write(tmp_path: Path):
+    """End to end version of the above, through the real code path: staging a
+    write, opening an ObjectStore over the same objects/ dir, and finishing."""
+    from synapsefs.store.atomic import atomic_writer
+    from synapsefs.store.objectstore import ObjectStore
+
+    objects_dir = tmp_path / "objects"
+    tmp_dir = objects_dir / "tmp"
+    tmp_dir.mkdir(parents=True)
+    target = objects_dir / "pack" / "big.pack"
+
+    with atomic_writer(target, tmp_dir=tmp_dir) as f:
+        f.write(b"first half ")
+        ObjectStore(objects_dir)          # a concurrent mount/log starting up
+        f.write(b"second half")
+
+    assert target.read_bytes() == b"first half second half"
 
 
 def test_gc_tmp_dir_on_missing_directory_is_a_noop(tmp_path: Path):

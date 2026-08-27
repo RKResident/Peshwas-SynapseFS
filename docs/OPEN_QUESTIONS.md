@@ -76,15 +76,17 @@ hash resolution silently stops finding them.
 answer, say so explicitly in FORMAT.md so nobody "optimizes" it later.
 *Settles:* FORMAT.md §5.
 
-**2.3 `gc_tmp_dir` runs on every `ObjectStore` construction.**
-Correct single-process. But with a live FUSE mount and a concurrent `commit`,
-constructing an `ObjectStore` in one process deletes the other's in-flight temp
-file, and that in-flight `atomic_write` then fails at `os.rename`.
-*Why it matters:* the PS grades concurrent mount + commit.
-*Options:* (a) age-gate — skip files with mtime under a few minutes (cheap);
-(b) move the GC to an explicit `Repo.open()` startup step (clean).
-*Settles:* `store/objectstore.py`, `store/atomic.py::gc_tmp_dir` docstring —
-which currently argues safety while assuming a single writer, and should say so.
+**2.3 `gc_tmp_dir` still runs on every `ObjectStore` construction.**
+**Partially settled.** Option (a) is done: `gc_tmp_dir` now skips files younger
+than `TMP_MIN_AGE_SECONDS` (15 min), so a concurrent `ObjectStore` open no
+longer destroys an in-flight commit. Packfiles made this urgent — a pack stages
+for the length of a whole checkpoint encode, not microseconds.
+*What remains:* option (b), moving the GC to an explicit `Repo.open()` startup
+step so it runs once per process rather than per `ObjectStore`. Then the age
+gate becomes belt-and-braces instead of the load-bearing guard it is today.
+*Why it still matters:* the age gate is a heuristic; a genuinely long write
+(a 7B checkpoint on slow disk) could in principle outlive it.
+*Settles:* `store/repo.py`, `store/objectstore.py`.
 
 **2.4 Does `message` belong in `commit --json`?**
 CLI.md §3.1's human example embeds the commit message; its `--json` block does
@@ -107,12 +109,15 @@ deterministic; gave ~5% on synthetic samples, which is not evidence.
 *Settles:* FORMAT.md §13.
 
 **3.2 Dynamic re-basing trigger.**
-The fixed interval is settled — every 4th commit is stored in full, bounding
-reconstruction depth at 3 (FORMAT.md §12A). What remains is replacing that
-schedule with a response to the data: force a baseline when consecutive
-commits become *incompatible*, i.e. when the residual stops being cheap.
-*Why it matters:* a fixed N re-bases too often on a stable fine-tune run and
-too rarely across a sharp change; both cost graded wall-clock.
+The topology is settled — commits form a **star**: every residual diffs
+directly against its group's full checkpoint, and every 4th commit starts a
+new one (FORMAT.md §12A). Reconstruction is two decodes regardless of history
+length. What remains is replacing the fixed count with a response to the data:
+start a new hub when the group's residuals stop being cheap.
+*Why it matters:* N now bounds how far a group drifts from its hub. Fixed at 4
+it re-bases too often on a stable run (paying a full checkpoint for nothing)
+and too rarely across a sharp change (paying inflated residuals); both cost
+graded storage or wall-clock.
 *What would settle it:* the same measurements as 3.3 — the statistic is
 probably residual-ratio degradation or the per-commit `raw-zstd` fallback
 rate, both of which the encoder already computes.

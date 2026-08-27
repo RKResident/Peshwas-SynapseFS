@@ -38,13 +38,69 @@ from typing import Dict, List, Optional
 import blake3
 
 from synapsefs.errors import IntegrityError
-from synapsefs.pack.index import PackIndex
-from synapsefs.pack.pack import PackEntry
+from synapsefs.pack.index import PackIndex, write_index
+from synapsefs.pack.pack import PackEntry, scan_pack, verify_pack
 from synapsefs.store.atomic import atomic_write
 
-__all__ = ["ORDER_FILENAME", "Located", "PackSet"]
+__all__ = ["ORDER_FILENAME", "Located", "PackSet", "recover_packs"]
 
 ORDER_FILENAME = "order"
+
+
+def recover_packs(pack_dir: Path, *, tmp_dir: Path) -> List[str]:
+    """Rebuild any index missing for a sealed pack. Returns human-readable notes.
+
+    A crash between sealing a pack and writing its index leaves a `.pack` with
+    no `.idx`. That pack is **authoritative data** -- it holds committed chunks
+    -- while the index is derived and regenerable by rescanning records from
+    offset 52. So the recovery rule is *rebuild*, never discard:
+
+    * **Trailer valid, index missing or unreadable** -> the pack is complete.
+      Rescan it and write a fresh index.
+    * **Trailer invalid or absent** -> the pack was never sealed; it is a
+      crashed partial write. No ref can reference it, because refs are written
+      last (FORMAT.md 9.4), so leaving it alone loses nothing. It is *not*
+      deleted here either: deleting data during recovery is how a bug becomes
+      data loss, and an unreferenced file costs only disk.
+
+    Without this step the failure is quiet rather than loud. `PackSet`
+    enumerates `*.idx`, so a pack with no index is not "degraded" -- it is
+    invisible, and every chunk in it reports as absent.
+
+    Only packs that actually lack a usable index are read, so the normal
+    startup cost is one `stat` per pack.
+    """
+    notes: List[str] = []
+    if not pack_dir.is_dir():
+        return notes
+
+    for pack_path in sorted(pack_dir.glob("*.pack")):
+        index_path = pack_path.with_suffix(".idx")
+        if index_path.is_file():
+            try:
+                PackIndex(index_path).close()
+                continue                      # usable index; nothing to do
+            except IntegrityError:
+                notes.append(f"{index_path.name}: unreadable, rebuilding")
+
+        try:
+            pack_hash = verify_pack(pack_path)
+        except IntegrityError as exc:
+            notes.append(f"{pack_path.name}: not sealed, ignored ({exc})")
+            continue
+
+        if pack_hash.hex() != pack_path.stem:
+            notes.append(
+                f"{pack_path.name}: contents hash to {pack_hash.hex()[:16]}, "
+                f"ignored"
+            )
+            continue
+
+        write_index(index_path, pack_hash=pack_hash,
+                    entries=scan_pack(pack_path), tmp_dir=tmp_dir)
+        notes.append(f"{pack_path.name}: index rebuilt from {len(scan_pack(pack_path))} records")
+
+    return notes
 
 
 @dataclass(frozen=True)
@@ -59,13 +115,15 @@ class Located:
 class PackSet:
     """Every pack in a repo, opened for lookup. Context manager; also `.close()`.
 
-    Construction mmaps each `.idx` -- cheap, and near-zero resident, since an
-    index is designed to be searched in place. Pack files themselves are
+    Construction first runs `recover_packs` (disable with `repair=False`),
+    then mmaps each `.idx` -- cheap, and near-zero resident, since an index is
+    designed to be searched in place. Pack files themselves are
     opened lazily, on the first read that needs one, so a lookup-only workload
     (which is what `already_have` is) never opens a single pack.
     """
 
-    def __init__(self, pack_dir: Path, *, tmp_dir: Optional[Path] = None):
+    def __init__(self, pack_dir: Path, *, tmp_dir: Optional[Path] = None,
+                 repair: bool = True):
         self.pack_dir = Path(pack_dir)
         # Defaults to the sibling `objects/tmp/`, which is where every other
         # atomic write in the repo stages. Must be on the same filesystem.
@@ -74,6 +132,9 @@ class PackSet:
         self._indexes: List[PackIndex] = []
         self._pack_files: Dict[bytes, object] = {}
         self._closed = False
+        self.recovery_notes: List[str] = (
+            recover_packs(self.pack_dir, tmp_dir=self.tmp_dir) if repair else []
+        )
         self._open_indexes()
 
     # -- construction ------------------------------------------------------

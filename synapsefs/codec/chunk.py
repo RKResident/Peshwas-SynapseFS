@@ -22,7 +22,7 @@ Three properties this module guarantees, each pinned by a test:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import blake3
@@ -234,6 +234,20 @@ class EncodedChunk:
     up a stream length that has started to diverge.
     """
 
+    is_identical: bool = False
+    """True when this chunk's content was byte-identical to its base chunk.
+
+    Cheap to know here and expensive to recover later: the delta array is
+    already in hand, so `not delta.any()` is one vectorized pass against a zstd
+    compression that costs orders of magnitude more. The caller uses it to
+    apply FORMAT.md 4.5's reuse rule -- a tensor whose every chunk is identical
+    needs no new tensor-manifest at all.
+
+    Always False for a base-less chunk: "identical to nothing" is not a
+    meaningful claim, and treating it as one would make root commits reuse a
+    manifest that does not exist.
+    """
+
     @property
     def stored_len(self) -> int:
         """Compressed size. Derived rather than stored, so it cannot drift out
@@ -262,13 +276,20 @@ def _as_bits(arr: np.ndarray, width: int, role: str) -> np.ndarray:
     return a.view(_UINT_OF[width]).reshape(-1)
 
 
-def _finish(encoding: str, stream: bytes, payload: bytes, original_len: int) -> EncodedChunk:
+def _finish(
+    encoding: str,
+    stream: bytes,
+    payload: bytes,
+    original_len: int,
+    is_identical: bool = False,
+) -> EncodedChunk:
     return EncodedChunk(
         encoding=encoding,
         content_hash=blake3.blake3(stream).digest(),
         payload=payload,
         plain_len=len(stream),
         original_len=original_len,
+        is_identical=is_identical,
     )
 
 
@@ -344,8 +365,14 @@ def encode_chunk(
     b_bits = _as_bits(base, width, "base")
 
     delta = to_monotone_key(t_bits, kind) - to_monotone_key(b_bits, kind)
+    # An all-zero delta means the chunk is byte-identical to its base. Computed
+    # from the delta rather than from the encoding that wins below, because it
+    # is a fact about the *content*, not about how it ended up stored.
+    is_identical = not delta.any()
     stream = zigzag(delta).tobytes()
-    encoded = _finish(DELTA, stream, compressor.compress(stream), original_len)
+    encoded = _finish(
+        DELTA, stream, compressor.compress(stream), original_len, is_identical
+    )
 
     if allow_raw_fallback:
         alternative = encode_raw()
@@ -355,7 +382,7 @@ def encode_chunk(
             # dedups against every other identical raw chunk in the repo,
             # whereas a residual is only ever identical to a residual taken
             # against the same base.
-            return alternative
+            return replace(alternative, is_identical=is_identical)
     return encoded
 
 

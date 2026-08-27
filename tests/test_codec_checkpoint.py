@@ -47,6 +47,7 @@ from synapsefs.safetensors_io import SafetensorsFile
 FIXTURE_ROOT = Path("fixtures")
 
 MANIFEST_FIELDS = {
+    "content_hash",
     "name",
     "dtype",
     "shape",

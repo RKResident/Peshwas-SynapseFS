@@ -48,16 +48,43 @@ def test_get_missing_object_raises_typed_error(tmp_path: Path):
 
 
 def test_startup_gc_clears_stale_tmp_files(tmp_path: Path):
-    """A stray file in objects/tmp/ (simulating a prior crash) should be
-    gone the moment a new ObjectStore is opened over the same directory."""
+    """A stray file in objects/tmp/ (simulating a prior crash) should be gone
+    once a new ObjectStore is opened over the same directory -- but only after
+    it is old enough to be unambiguously abandoned rather than in flight.
+
+    The mtime is backdated rather than the gate being disabled, so this test
+    exercises `ObjectStore.__init__`'s real call with its real default.
+    See `atomic.gc_tmp_dir` for why the gate exists.
+    """
+    import os
+    import time
+
+    from synapsefs.store.atomic import TMP_MIN_AGE_SECONDS
+
     objects_dir = tmp_path / "objects"
     tmp_dir = objects_dir / "tmp"
     tmp_dir.mkdir(parents=True)
-    (tmp_dir / "stale.tmp").write_bytes(b"junk")
+    stale = tmp_dir / "stale.tmp"
+    stale.write_bytes(b"junk")
+    old = time.time() - TMP_MIN_AGE_SECONDS - 60
+    os.utime(stale, (old, old))
 
     ObjectStore(objects_dir)  # opening should GC as a side effect
 
     assert list(tmp_dir.iterdir()) == []
+
+
+def test_startup_gc_spares_a_concurrent_writers_temp_file(tmp_path: Path):
+    """The other half: a *fresh* temp file must survive an ObjectStore open,
+    because it probably belongs to a commit that is still running."""
+    objects_dir = tmp_path / "objects"
+    tmp_dir = objects_dir / "tmp"
+    tmp_dir.mkdir(parents=True)
+    (tmp_dir / "in-flight.tmp").write_bytes(b"partial")
+
+    ObjectStore(objects_dir)
+
+    assert [p.name for p in tmp_dir.iterdir()] == ["in-flight.tmp"]
 
 
 def test_hash_is_content_addressed_blake3(tmp_path: Path):
