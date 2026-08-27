@@ -1,0 +1,254 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <netinet/in.h>
+#include <stdexcept>
+#include <sys/socket.h>
+#include <system_error>
+#include <vector>
+#include <unordered_set>
+
+const int hash_len = 64;
+
+enum Operation {
+    Op_PUSH = 1,
+    Op_PULL = 2
+};
+
+typedef std::array<char, hash_len> Hash;
+
+inline std::ostream& operator<<(std::ostream& os, const Hash& hash) {
+    for (char c : hash) {
+        os << c;
+    }
+    return os;
+}
+
+struct HashHasher {
+    std::size_t operator()(const Hash &hash) const noexcept {
+        std::size_t h = 0;
+
+        for(int i = 0; i < sizeof(std::size_t); i++) {
+            ((char*)&h)[i] = ((hash[2*i] <= '9' ? hash[2*i] - '0' : hash[2*i] - 'a' + 10) << 4) |
+                (hash[2*i+1] <= '9' ? hash[2*i+1] - '0' : hash[2*i+1] - 'a' + 10);
+        }
+
+        return h;
+    }
+};
+struct HashList {
+    std::vector<Hash> ordered;
+    std::unordered_set<Hash, HashHasher> seen;
+
+    bool insert(const Hash &hash) {
+        if (!seen.insert(hash).second)
+            return false;
+
+        ordered.push_back(hash);
+        return true;
+    }
+
+    bool contains(const Hash &hash) const {
+        return seen.find(hash) != seen.end();
+    }
+};
+inline void make_hash(Hash &out, const char *str) {
+    if(std::strlen(str) != 64) {
+        throw std::invalid_argument("Hash must be exactly 64 characters");
+    }
+
+    std::memcpy(out.data(), str, 64);
+}
+
+inline std::string branch_path(const std::string branch) {
+    return "refs/heads/" + branch;
+}
+inline std::string hash_path(const Hash hash) {
+    std::string path = "objects/";
+    path.append(hash.data(), 2);
+    path.push_back('/');
+    path.append(hash.data() + 2, hash_len - 2);
+    return path;
+}
+inline std::string chunk_path(const Hash hash) {
+    std::string path = "objects/chunks/";
+    path.append(hash.data(), 2);
+    path.push_back('/');
+    path.append(hash.data() + 2, 2);
+    path.push_back('/');
+    path.append(hash.data() + 4, hash_len - 4);
+    return path;
+}
+
+inline bool has_hash(const Hash hash) {
+    std::filesystem::path file_path = hash_path(hash);
+    if(std::filesystem::exists(file_path)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+inline bool hash_chunk(const Hash hash) {
+    std::filesystem::path file_path = chunk_path(hash);
+    if(std::filesystem::exists(file_path)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+inline bool send_all(int sock, const void* data, size_t len) {
+    const char* ptr = static_cast<const char*>(data);
+    while(len > 0) {
+        ssize_t n = send(sock, ptr, len, 0);
+        if(n < 0) {
+            if(errno == EINTR)
+                continue;
+            return false;
+        }
+        if(n == 0) {
+            return false;
+        }
+        ptr += n;
+        len -= n;
+    }
+    return true;
+}
+inline bool recv_all(int sock, void* data, size_t len) {
+    char* ptr = static_cast<char*>(data);
+    while(len > 0) {
+        ssize_t n = recv(sock, ptr, len, 0);
+        if(n < 0) {
+            if(errno == EINTR)
+                continue;
+            return false;
+        }
+        if(n == 0) {
+            return false;
+        }
+        ptr += n;
+        len -= n;
+    }
+    return true;
+}
+
+inline bool send_string(int sock, const std::string &str) {
+    uint32_t len = htonl(static_cast<uint32_t>(str.size()));
+
+    return send_all(sock, &len, sizeof(len)) &&
+           send_all(sock, str.data(), str.size());
+}
+inline bool recv_string(int sock, std::string &str) {
+    uint32_t net_len;
+    if(!recv_all(sock, &net_len, sizeof(net_len))) { return false; }
+    uint32_t len = ntohl(net_len);
+    str.resize(len);
+    return recv_all(sock, str.data(), len);
+}
+
+inline bool send_file(int sock, const std::filesystem::path& path) {
+    std::error_code ec;
+    auto file_size = std::filesystem::file_size(path, ec);
+    if(ec || file_size > UINT32_MAX) {
+        return false;
+    }
+
+    uint32_t len = static_cast<uint32_t>(file_size);
+    uint32_t net_len = htonl(len);
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    std::vector<char> data(len);
+    if(len > 0) {
+        file.read(data.data(), len);
+        if(!file) {
+            return false;
+        }
+    }
+
+    // [4 bytes][file data]
+    if(!send_all(sock, &net_len, sizeof(net_len))) {
+        return false;
+    }
+    if(len > 0 && !send_all(sock, data.data(), len)) {
+        return false;
+    }
+
+    return true;
+}
+inline bool recv_file(int sock, const std::filesystem::path& final_path) {
+    uint32_t net_len;
+    if(!recv_all(sock, &net_len, sizeof(net_len))) {
+        return false;
+    }
+    uint32_t len = ntohl(net_len);
+
+    // Temporary file in the same directory as the final file.
+    std::filesystem::path tmp_path = final_path;
+    tmp_path += ".tmp";
+
+    std::error_code ec;
+    std::filesystem::create_directories(tmp_path.parent_path(), ec);
+    if(ec) {
+        std::cerr << "failed to create directory: " << ec.message() << '\n';
+        return false;
+    }
+
+    std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
+    if(!file) {
+        return false;
+    }
+
+    std::vector<char> data(len);
+    if(len > 0) {
+        if(!recv_all(sock, data.data(), len)) {
+            file.close();
+            std::filesystem::remove(tmp_path);
+            return false;
+        }
+        file.write(data.data(), len);
+        if(!file) {
+            file.close();
+            std::filesystem::remove(tmp_path);
+            return false;
+        }
+    }
+
+    file.close();
+    if(!file) {
+        std::filesystem::remove(tmp_path);
+        return false;
+    }
+
+    // Atomic replacement/install.
+    std::filesystem::rename(tmp_path, final_path, ec);
+
+    if(ec) {
+        std::filesystem::remove(tmp_path);
+        return false;
+    }
+    return true;
+}
+
+/* Dependency Tree:
+ * branch   > commit
+ * commit   > checkpoint_manifest
+ *          > parents
+ * checkpoint_manifest  > header_object
+ *                      > tensor_manifests
+ * tensor_manifests > parents
+ *                  > base_row_permutation
+ *                  > base_col_permutation
+ *                  > chunks
+ */
+
+
+

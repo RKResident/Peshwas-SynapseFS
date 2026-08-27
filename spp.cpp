@@ -8,43 +8,59 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-#include <nlohmann/json.hpp>
+#include "serve.cpp"
 
-
-void listener(const uint16_t port, const std::string branch) {
-    int server = socket(AF_INET, SOCK_STREAM, 0);
+int connect_server(const std::string ip, const uint16_t port, const std::string branch,
+        Operation op, bool &success) {
+    int client = socket(AF_INET, SOCK_STREAM, 0);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = inet_addr(ip.c_str());
 
-    bind(server, (sockaddr*)&addr, sizeof(addr));
-    listen(server, 1);
+    if(connect(client, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        close(client);
+        success = false;
+        return 1;
+    }
 
-    std::cout << "Waiting...\n";
+    std::cout << "sending operation: " << (op == Op_PULL ? "pull" : "push") << std::endl;
+    char op_char = op;
+    if(!send_all(client, &op_char, sizeof(op_char))) {
+        std::cerr << "could not send operation" << std::endl;
+        close(client);
+        success = false;
+        return 1;
+    } else {
+        std::cout << "sent operation" << std::endl;
+    }
+    std::cout << "sending branch: " << branch << std::endl;
+    if(!send_string(client, branch)) {
+        std::cerr << "could not send branch" << std::endl;
+        close(client);
+        success = false;
+        return -1;
+    } else {
+        std::cout << "sent branch" << std::endl;
+    }
 
-    int client = accept(server, nullptr, nullptr);
-
-    uint32_t length;
-    recv(client, &length, 4, 0);
-
-    length = ntohl(length);
-
-    std::string message(length, '\0');
-    recv(client, message.data(), length, 0);
-
-    std::cout << "Received: " << message << '\n';
-
-    close(client);
-    close(server);
+    success = true;
+    return client;
 }
+
 
 int main(int argc, char** argv) {
     if(argc < 2) {
         std::cout << "Improper usage" << std::endl;
+        return 1;
     }
-    if(std::string(argv[1]) == "listener") {
+    if(std::string(argv[1]) == "serve") {
+        if(argc != 3) {
+            std::cout << "Improper usage" << std::endl;
+            return 1;
+        }
         uint16_t port;
         try {
             port = std::stoi(argv[2]);
@@ -55,9 +71,13 @@ int main(int argc, char** argv) {
             std::cout << "Invalid port" << std::endl;
             return 1;
         }
-        const std::string branch = argv[3];
-        listener(port, branch);
-    } else {
+        return serve(port);
+    } else if(std::string(argv[1]) == "push"
+            || std::string(argv[1]) == "pull") {
+        if(argc != 5) {
+            std::cerr << "Improper usage" << std::endl;
+            return 1;
+        }
         const std::string ip = argv[2];
         struct sockaddr_in sa;
         if(inet_pton(AF_INET, argv[2], &sa.sin_addr) != 1) {
@@ -75,7 +95,31 @@ int main(int argc, char** argv) {
             return 1;
         }
         const std::string branch = argv[4];
-        sender(ip, port, branch);
+        bool success;
+        int socket = connect_server(ip, port, branch,
+                std::string(argv[1]) == "push" ? Op_PUSH : Op_PULL, success);
+        if(!success) {
+            std::cerr << "could not connect to server" << std::endl;
+            return 1;
+        }
+        if(std::string(argv[1]) == "pull") {
+            if(!pull(socket, branch)) {
+                close(socket);
+                return 1;
+            } else {
+                return 0;
+            }
+        } else {
+            if(!push(socket, branch)) {
+                close(socket);
+                return 1;
+            } else {
+                return 0;
+            }
+        }
+    } else {
+        std::cerr << "Improper usage" << std::endl;
+        return 1;
     }
 }
 
