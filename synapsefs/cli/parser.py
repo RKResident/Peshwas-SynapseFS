@@ -18,9 +18,6 @@ from synapsefs.cli.commands import init as init_cmd
 from synapsefs.cli.commands import commit as commit_cmd
 from synapsefs.cli.commands import mount as mount_cmd
 from synapsefs.cli.commands import unmount as unmount_cmd
-
-# Every module listed here must expose add_subparser(subparsers, global_parser).
-_COMMAND_MODULES = [init_cmd, commit_cmd, mount_cmd, unmount_cmd]
 from synapsefs.cli.commands import log as log_cmd
 from synapsefs.cli.commands import branch as branch_cmd
 from synapsefs.cli.commands import checkout as checkout_cmd
@@ -33,7 +30,7 @@ from synapsefs.cli.commands import verify as verify_cmd
 # lifecycle-first rather than alphabetically.
 _COMMAND_MODULES = [
     init_cmd, commit_cmd, log_cmd, branch_cmd, checkout_cmd, restore_cmd,
-    verify_cmd,
+    verify_cmd, mount_cmd, unmount_cmd
 ]
 
 
