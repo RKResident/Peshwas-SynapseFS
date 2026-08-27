@@ -296,7 +296,10 @@ def test_commit_objects_match_the_documented_schema(tmp_path):
     repo = Repo.find(repo_dir)
 
     head = graph.get_json(repo.store, repo.resolve_ref("HEAD"))
-    assert set(head) == {"checkpoint_manifest", "parents", "timestamp", "message", "full"}
+    assert set(head) == {
+        "checkpoint_manifest", "parents", "timestamp", "message", "full",
+        "checkpoint_name",
+    }
     assert len(head["parents"]) == 1
 
     manifest = graph.get_json(repo.store, head["checkpoint_manifest"])

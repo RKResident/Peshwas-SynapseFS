@@ -16,11 +16,20 @@ import argparse
 from synapsefs import __version__
 from synapsefs.cli.commands import init as init_cmd
 from synapsefs.cli.commands import commit as commit_cmd
+from synapsefs.cli.commands import log as log_cmd
+from synapsefs.cli.commands import branch as branch_cmd
+from synapsefs.cli.commands import checkout as checkout_cmd
+from synapsefs.cli.commands import restore as restore_cmd
+from synapsefs.cli.commands import verify as verify_cmd
 
 # Every module listed here must expose add_subparser(subparsers, global_parser).
-# Add commit, checkout, branch, log, verify, push, pull, serve, merge, mount,
-# unmount here as each one lands.
-_COMMAND_MODULES = [init_cmd, commit_cmd]
+# Add verify, push, pull, serve, merge, mount and unmount here as each one
+# lands. Order is the order `--help` lists them in, so it runs roughly
+# lifecycle-first rather than alphabetically.
+_COMMAND_MODULES = [
+    init_cmd, commit_cmd, log_cmd, branch_cmd, checkout_cmd, restore_cmd,
+    verify_cmd,
+]
 
 
 def _build_global_parser() -> argparse.ArgumentParser:

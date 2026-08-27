@@ -281,3 +281,87 @@ class Repo:
             f"ref: refs/heads/{branch}\n".encode("utf-8"),
             tmp_dir=self.objects_dir / "tmp",
         )
+
+    def set_head_detached(self, commit_hash: str) -> None:
+        """Atomically point HEAD directly at `commit_hash`, detaching it.
+
+        The other half of `checkout` (CLI.md ~4): `checkout <branch>` attaches
+        HEAD to a ref, `checkout <commit>` writes the raw hash instead. The
+        absence of a `ref: ` prefix is the *only* on-disk difference between
+        the two states, which is what `read_head` keys off.
+        """
+        atomic_write(
+            self.head_path,
+            f"{commit_hash}\n".encode("utf-8"),
+            tmp_dir=self.objects_dir / "tmp",
+        )
+
+    def branch_exists(self, name: str) -> bool:
+        """Whether `refs/heads/<name>` exists.
+
+        Structurally invalid names return False rather than raising: callers
+        use this to *decide* whether an argument is a branch or a commit-ish
+        (`checkout` does exactly that), and a name like `9f2c1a` must be
+        answerable without an exception.
+        """
+        return _is_valid_branch_name(name) and (self.refs_heads_dir / name).is_file()
+
+    def list_branches(self) -> dict:
+        """`{branch name: commit hash}` for every ref under `refs/heads/`.
+
+        Sorted by name so `branch`'s listing is stable between runs rather
+        than following directory order. Subdirectories are ignored: branch
+        names are validated to contain no `/`, so a directory here is not a
+        ref this implementation ever wrote.
+        """
+        if not self.refs_heads_dir.is_dir():
+            return {}
+        return {
+            path.name: path.read_text(encoding="utf-8").strip()
+            for path in sorted(self.refs_heads_dir.iterdir())
+            if path.is_file()
+        }
+
+    def delete_branch(self, name: str) -> str:
+        """Remove `refs/heads/<name>`, returning the hash it pointed at.
+
+        Refusing to delete the branch HEAD is attached to (CLI.md ~5,
+        "Deleting the current branch fails with 2") is the caller's job, not
+        this method's -- `Repo` reports state, the command decides policy.
+        Deleting a ref is a plain unlink: no atomicity dance is needed because
+        a ref either exists or it doesn't, and unlink is already atomic.
+        """
+        _validate_branch_name(name)
+        path = self.refs_heads_dir / name
+        if not path.is_file():
+            raise UsageError(f"branch not found: {name!r}")
+        commit_hash = path.read_text(encoding="utf-8").strip()
+        path.unlink()
+        return commit_hash
+
+    def rename_branch(self, old: str, new: str) -> str:
+        """Move `refs/heads/<old>` to `refs/heads/<new>`, re-attaching HEAD if
+        it was pointing at `old`.
+
+        Written as create-then-delete rather than `Path.rename`, so that a
+        crash between the two steps leaves *both* refs rather than neither --
+        two names for one commit is a cosmetic problem, a lost branch head is
+        not. HEAD is re-attached last, for the same reason `commit` moves the
+        ref last: until that write, HEAD still names a ref that exists.
+        """
+        _validate_branch_name(old)
+        _validate_branch_name(new)
+        source = self.refs_heads_dir / old
+        if not source.is_file():
+            raise UsageError(f"branch not found: {old!r}")
+        if old != new and (self.refs_heads_dir / new).is_file():
+            raise UsageError(f"branch already exists: {new!r}")
+
+        commit_hash = source.read_text(encoding="utf-8").strip()
+        self.update_ref(new, commit_hash)
+        if old != new:
+            source.unlink()
+            branch, _ = self.read_head()
+            if branch == old:
+                self.set_head_branch(new)
+        return commit_hash

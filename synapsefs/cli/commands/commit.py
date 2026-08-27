@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from synapsefs import graph
+from synapsefs.cli import output
 from synapsefs.codec.checkpoint import encode_checkpoint
 from synapsefs.errors import UsageError
 from synapsefs.pack.index import write_index
@@ -210,6 +211,10 @@ def run(args: argparse.Namespace) -> dict:
         message=args.message,
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         full=store_full,
+        # Basename only -- see write_commit_object's docstring. `checkout`
+        # joins this onto the repo root, so anything path-shaped here would be
+        # a traversal primitive.
+        checkpoint_name=checkpoint.name,
     )
 
     repo.update_ref(branch, commit_hash)
@@ -221,6 +226,7 @@ def run(args: argparse.Namespace) -> dict:
         "base": None if store_full else anchor,
         "full": store_full,
         "message": args.message,
+        "checkpoint_name": checkpoint.name,
         "tensors": encoded.tensors,
         "original_bytes": original,
         "residual_bytes": encoded.stored_bytes,
@@ -257,15 +263,6 @@ def _resolve_config(store, config_path: Path, base_hash: Optional[str]) -> Optio
     return base_manifest.get("topology_config_hash")
 
 
-def _human_bytes(n: float) -> str:
-    """Render a byte count the way CLI.md ~3.1's worked example does
-    (e.g. `3.2 GiB`)."""
-    value = float(n)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if value < 1024 or unit == "TiB":
-            return f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{value:.1f} TiB"  # pragma: no cover - unreachable, see loop above
 
 
 def format_human(result: dict) -> str:
@@ -298,10 +295,10 @@ def format_human(result: dict) -> str:
             lines.append("  identity permutation detected -- fast path")
     lines.append(
         f"Encoding {result.get('tensors', 0)} tensors, "
-        f"{_human_bytes(result.get('original_bytes', 0))}"
+        f"{output.human_bytes(result.get('original_bytes', 0))}"
     )
     lines.append(
-        f"  residual: {_human_bytes(result.get('residual_bytes', 0))} "
+        f"  residual: {output.human_bytes(result.get('residual_bytes', 0))} "
         f"({result.get('residual_ratio', 0.0) * 100:.2f}% of original)"
     )
     lines.append(

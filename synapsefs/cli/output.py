@@ -35,3 +35,18 @@ def emit(result: dict, args: argparse.Namespace, human: str) -> None:
         sys.stdout.write(json.dumps(result) + "\n")
     else:
         sys.stdout.write(human + "\n")
+
+
+def human_bytes(n: float) -> str:
+    """Render a byte count the way CLI.md's worked examples do (e.g. `3.2 GiB`).
+
+    Lives here rather than in any one command because `commit`, `log`,
+    `checkout` and `compare` all print sizes, and four independently-written
+    roundings would eventually disagree with each other in the demo output.
+    """
+    value = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"  # pragma: no cover - unreachable, see loop above

@@ -70,6 +70,8 @@ __all__ = [
     "CheckpointObjects",
     "write_checkpoint_objects",
     "write_commit_object",
+    "walk_first_parent",
+    "checkpoint_sizes",
     "CommitCheckpoint",
 ]
 
@@ -169,6 +171,7 @@ def write_commit_object(
     message: str,
     timestamp: str,
     full: bool,
+    checkpoint_name: str,
 ) -> str:
     """Write a `commit` object (FORMAT.md 4.6) and return its hash.
 
@@ -178,6 +181,15 @@ def write_commit_object(
     is due would mean loading every tensor-manifest of every ancestor to see
     whether they all have a null base -- an O(tensors x depth) walk to answer a
     one-bit question. See FORMAT.md 4.6 for the field.
+
+    `checkpoint_name` is the second extension: the basename of the file that
+    was committed. `checkout` without `--out` has to write the checkpoint back
+    into the working tree "under the filename recorded in the commit"
+    (CLI.md ~4), and there is nowhere else to record it -- the safetensors
+    header names tensors, not the file. Storing the *basename* only is
+    deliberate: the committer's absolute path is their business, and a commit
+    that could steer a later checkout into writing outside the repo root would
+    be a path-traversal bug waiting to happen.
     """
     return put_json(
         store,
@@ -187,6 +199,7 @@ def write_commit_object(
             "timestamp": timestamp,
             "message": message,
             "full": full,
+            "checkpoint_name": checkpoint_name,
         },
     )
 
@@ -233,6 +246,77 @@ def nearest_full_ancestor(store: ObjectStore, commit_hash: Optional[str]) -> Opt
             return current
         current = commit["parents"][0]
     return None
+
+
+def walk_first_parent(
+    store: ObjectStore, commit_hash: Optional[str], *, limit: Optional[int] = None
+) -> List[Tuple[str, dict]]:
+    """`(hash, commit object)` from `commit_hash` back to the root, newest first.
+
+    First-parent only, which is what CLI.md ~6 makes `log`'s default: a merge's
+    second parent is a different lineage, and splicing it into a linear listing
+    would interleave two histories with no way to tell them apart. `--graph`
+    renders the extra parents from each commit's own `parents` list instead, so
+    the walk itself never needs a second mode.
+
+    `limit` stops the walk early rather than truncating afterwards -- `log -n 3`
+    on a thousand-commit repo should read three objects, not a thousand.
+    """
+    out: List[Tuple[str, dict]] = []
+    current = commit_hash
+    while current is not None and (limit is None or len(out) < limit):
+        commit = get_json(store, current)
+        out.append((current, commit))
+        parents = commit.get("parents") or []
+        current = parents[0] if parents else None
+    return out
+
+
+def checkpoint_sizes(store: ObjectStore, packs: PackSet, commit_hash: str) -> dict:
+    """`{"original_bytes", "stored_bytes", "tensors", "chunks"}` for one commit.
+
+    Neither number is recorded in the commit object, and deliberately so: a
+    commit is immutable and content-addressed, and both figures are *derived*
+    from objects it already points at. Baking them in would put a cached
+    summary inside a hash -- so a repack that changed nothing semantically
+    would fork the commit identity, and a stale figure could never be
+    corrected. Recomputing here costs one JSON read per tensor plus one index
+    lookup per chunk, both of which are already mmap'd.
+
+    `stored_bytes` counts each distinct chunk object **once**, even when
+    several tensors or several commits reference it. That is the honest
+    reading of "what this commit costs on disk": a deduped chunk was paid for
+    by whoever wrote it first.
+    """
+    commit = get_json(store, commit_hash)
+    manifest = get_json(store, commit["checkpoint_manifest"])
+
+    original = 0
+    stored = 0
+    seen: set = set()
+    for manifest_hash in manifest["tensors"].values():
+        tensor = get_json(store, manifest_hash)
+        width, _kind = dtype_spec(tensor["dtype"])
+        count = 1
+        for dim in tensor["shape"]:
+            count *= dim
+        original += width * count
+
+        for chunk in tensor["chunks"]:
+            object_hex = chunk["object"]
+            if object_hex in seen:
+                continue
+            seen.add(object_hex)
+            located = packs.lookup(bytes.fromhex(object_hex))
+            if located is not None:
+                stored += located.entry.stored_len
+
+    return {
+        "original_bytes": original,
+        "stored_bytes": stored,
+        "tensors": len(manifest["tensors"]),
+        "chunks": len(seen),
+    }
 
 
 class CommitCheckpoint:

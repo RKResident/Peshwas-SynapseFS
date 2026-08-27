@@ -212,7 +212,7 @@ Deleting the current branch fails with **2**.
 ## 6. `log`
 
 ```
-synapsefs log [<ref>] [-n <count>] [--graph] [--oneline] [--json]
+synapsefs log [<ref>] [-n <count>] [--graph] [--oneline] [--no-size] [--json]
 ```
 
 Walks first-parent by default from `<ref>` (default `HEAD`); `--graph` shows all parents.
@@ -224,42 +224,161 @@ $ synapsefs log --oneline -n 3
 0a1b99  initial        2026-08-24T22:03:00Z   3.2 GiB (full)
 ```
 
+The size column is **derived, not recorded** — it is recomputed from the
+commit's tensor-manifests and the pack indexes each time (see FORMAT.md §4.6
+for why it is not a field on the commit). That costs one JSON read per tensor
+per commit listed, which is why `--no-size` exists for deep histories.
+
+---
+
+## 6A. `restore`
+
+```
+synapsefs restore [<ref>] [--out <path>] [--compare <checkpoint.safetensors>]
+                  [--all] [--strict]
+```
+
+Not required by the PS. It exists because `checkout` couples reconstruction to
+moving `HEAD`, and two things want the first without the second:
+
+- Pulling epoch 3's weights out to a scratch path to load in torch, leaving the
+  repo on whatever commit it was already on.
+- **Proving the codec is lossless**, which is what `--compare` is for. It
+  streams the commit and a reference file past each other and reports, per
+  tensor, how many elements differ and by how many **ULPs** — the integer
+  distance between the two values' bit patterns, via the same monotone key the
+  residual encoder uses (FORMAT.md §8).
+
+The ULP column is the point. A tolerance answers "is this close enough"; this
+codec's claim is stronger — the residual is exact integer arithmetic, so the
+answer must be *bit*-equal, and a single differing mantissa bit has to show up
+rather than round away. For a correct reconstruction every number in the table
+is zero.
+
+```
+$ synapsefs restore HEAD --out /tmp/e6.safetensors --compare epoch06.safetensors
+Wrote /tmp/e6.safetensors (6.1 MiB, 38 tensors)
+Comparing 22adae against epoch06.safetensors
+  (no differing tensors)
+  38/38 tensors bit-identical
+  whole-file comparison: byte-identical
+```
+
+Two checks run, not one. The per-tensor table compares the **live commit**
+against the reference, so it stays meaningful without `--out` and isolates the
+codec from the writer. `whole-file comparison` appears only when `--out` was
+given and compares the two files outright, headers included — that is the
+property §4 actually requires, and the tensor table cannot see a header
+difference.
+
+`--strict` turns a mismatch into exit **4**; without it `restore` is a pure
+report, since diffing two genuinely different checkpoints is a legitimate use.
+
 ---
 
 ## 7. `verify`
 
 ```
-synapsefs verify [<ref>] [--shallow | --deep] [--json]
+synapsefs verify [<ref>] [--shallow | --fast | --deep] [--content] [--packs]
+                 [--all] [--json]
 ```
 
-Walks and cryptographically verifies lineage. **Independent of `checkout` and `mount`**
-so integrity can be graded standalone — do not make it depend on either.
+Walks and cryptographically verifies lineage. **Independent of `checkout` and
+`mount`** so integrity can be graded standalone — it talks to the object store
+and pack set directly, and works on a repo whose FUSE mount is broken or absent.
 
-| Tier | Checks | Catches |
+Walks **every parent**, not first-parent only (PS 2f/2g): a merge's second
+parent is reachable history whose corruption is just as fatal. A visited set
+keeps a diamond from re-verifying its shared ancestry.
+
+### 7.1 Where trust comes from
+
+PS 2c fixes the root: *"Trust is rooted at a locally accepted commit/ref ID"*,
+and a peer presenting an entirely different but self-consistent history is
+explicitly out of scope. So the ref is the axiom and everything else is derived
+from it:
+
+```
+ref  (trusted by assumption)
+ └─ commit hash             → re-hash the commit's bytes
+     └─ checkpoint_manifest → re-hash
+         ├─ header_object   → re-hash
+         └─ tensor_manifest → re-hash
+             └─ chunks[].object → decompress the payload, re-hash
+```
+
+Every comparison is against a hash that came from the object's **parent**. That
+single property is what the command is for, and the tempting shortcuts break it:
+
+- Verifying a pack against its own trailer proves the pack is internally
+  consistent — which an attacker who rewrote it has already ensured.
+- Verifying a chunk against the checksum in the pack index proves the index and
+  the pack agree — which the same attacker has also ensured.
+
+Both are worth doing, because rot is the likelier failure and they are cheap.
+Neither can detect tampering, because the reference value lives in a file the
+attacker controls as fully as the payload.
+
+### 7.2 Tiers
+
+| Tier | Adds | Detects |
 |---|---|---|
-| `--shallow` | DAG structure: commit → checkpoint-manifest → tensor-manifests, re-hashed | Structural corruption, broken links |
-| *(default)* | Above + per-chunk stored-payload checksum from the pack index. No decompression. | Bit-rot, truncation, damaged pack |
-| `--deep` | Above + decompress each chunk, check its full content hash | **Malicious block injection** |
+| `--shallow` | Loose objects re-hashed against the hash their parent named; every chunk reference probed for existence | Structural corruption, broken links |
+| `--fast` | + each chunk's stored payload vs the index's 8-byte checksum. No decompression | **Bit-rot only** |
+| *(default)* `--deep` | + decompress each chunk, re-hash against `chunks[].object` | **Malicious block injection** |
+| `--content` | + reconstruct each tensor, check its manifest `content_hash` | A permutation applied in the wrong order |
 
-Be accurate about this in output and in the README: the default tier **cannot** detect a
-crafted payload carrying a matching stored checksum. Only `--deep` can.
+**`--deep` is the default**, departing from this document's earlier table which
+defaulted to the checksum tier. PS 2b asks specifically that malicious block
+injection be rejected, and the checksum tier structurally cannot do it. Measured
+on a 25-commit / 152 MiB history the difference is 0.19 s → 0.54 s; that is not
+a price worth paying to ship a default that detects no tampering.
+
+`--content` is separate rather than folded into `--deep` because it is the only
+check requiring *reconstruction* — a residual chunk must be applied to its base.
+Deep hashes the decompressed stream instead, so it needs no base and stays
+O(stored bytes). Costs ~4× deep.
+
+`--packs` re-hashes each pack file against its own trailer. Off by default: at
+the deep tier every *referenced* byte is already checked against a stronger,
+ref-anchored hash, so this only covers framing and unreferenced regions — at the
+cost of doubling read volume.
+
+`--all` verifies every branch rather than `<ref>`'s ancestry.
+
+### 7.3 Output
 
 ```
 $ synapsefs verify
-Verifying lineage for 'main' (3 commits)
-  commits 3/3   manifests 192/192   chunks 1500/1500
-OK  — 3 commits, 1500 chunks, 127.4 MiB verified in 0.31s
+Verifying lineage for 'HEAD' (25 commits) [content]
+  commits 25   manifests 950   chunks 950   objects 1002
+OK  -- 25 commits, 950 chunks, 129.1 MiB verified in 0.54s (239.0 MiB/s)
 
 $ synapsefs verify --deep
-FAIL — chunk aa01f3… in pack-7c2e… : content hash mismatch
-       expected aa01f3…  got 3e91b7…
-       referenced by tensor-manifest 44de01… ('layer3.weight', rows 512-1023)
+FAIL -- 1 integrity failure(s) in 6 commit(s)
+  chunk-content-mismatch: 38d3dea1e1c83835
+       expected 38d3dea1e1c83835...  got 7a74c3754ec310a3...
+       in pack 2569713655e43323....pack
+       referenced by tensor-manifest ccc7f5a7 ('blocks.0.bn1.bias', rows 0-95)
+       decompressed bytes do not match the hash the manifest names -- this block was substituted
 ```
 
 Exit **0** clean, **4** on any mismatch. `--json` includes `"ok": bool` and a
-`"failures"` array with `{object, pack, expected, actual, referenced_by}`.
+`"failures"` array of `{kind, object, pack, expected, actual, referenced_by,
+detail}`.
 
-`OPEN QUESTION` — whether `--deep` becomes the default once measured.
+`chunks` counts references walked; `chunks_distinct` counts what was actually
+read. The gap is the memoisation win — dedup plus §4.5 manifest reuse mean one
+chunk serves many commits, and it is most of why verification stays fast as
+history deepens (950 references → 810 distinct at 25 commits).
+
+Verification **never repairs**. `PackSet` rebuilds a missing index on open by
+default; `verify` opens with that disabled, because silently repairing the
+artifact under inspection and then reporting OK would make the command
+worthless.
+
+Failures are capped at 100 (reported as `truncated`). A corrupt pack yields one
+per chunk, and `ok` is already false after the first.
 
 ---
 

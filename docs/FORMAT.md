@@ -185,11 +185,33 @@ skip is the identity fast path in §9.)
   "checkpoint_manifest": "<hash>",
   "parents": ["<hash>", "..."],
   "timestamp": "2026-08-25T12:00:00Z",
-  "message": "commit message"
+  "message": "commit message",
+  "full": true,
+  "checkpoint_name": "epoch03.safetensors"
 }
 ```
 
 `parents`: empty for root, one for a normal commit, two or more for a merge.
+
+`full`: whether this commit stored its checkpoint outright rather than as a
+residual — i.e. whether it is a star hub (§12A). It is derived data living
+inside an immutable object, which is normally the wrong place for it; the
+alternative is worse. Deciding whether the re-basing interval is due otherwise
+means loading every tensor-manifest of every ancestor to check that all of
+their `base_tensor_manifest` fields are null — an O(tensors × depth) walk to
+answer a one-bit question, on the hot path of every single commit.
+
+`checkpoint_name`: the **basename** of the file that was committed. `checkout`
+with no `--out` has to restore the checkpoint into the working tree "under the
+filename recorded in the commit" (CLI.md §4), and the safetensors header names
+tensors, not files, so there is nowhere else to put it. Only the basename is
+stored, and readers must re-strip it: a commit that carried
+`../../.ssh/authorized_keys` here would otherwise be a write-anywhere
+primitive against anyone who checked it out.
+
+Commits written before either field existed are still readable: `full` defaults
+to false (the walk falls back to `parents == []` to find a root) and
+`checkpoint_name` falls back to `model.safetensors`.
 
 ---
 
@@ -559,27 +581,82 @@ granularity with no separate mechanism:
 
 ## 12. Verification tiers
 
-> **CHANGED FROM DRAFT.** The draft claimed `verify` never needs to decompress. That
-> depended on hashing compressed bytes, which §2 abandons. The capability is recovered
-> by splitting verify into two tiers — and the split is *more* honest about the threat
-> model, because the two tiers defend against different attacks.
+> **CHANGED FROM DRAFT (twice).** The draft claimed `verify` never needs to decompress;
+> that depended on hashing compressed bytes, which §2 abandons. The capability was
+> recovered by splitting verify into tiers. The *second* change is that the content
+> tier is now the **default** rather than an opt-in `--deep` — see §12B for why the
+> earlier default was indefensible.
 
-| Command | Does | Catches | Cost |
+| Tier | Does | Catches | Measured (25 commits, 152 MiB) |
 |---|---|---|---|
-| `verify --shallow` | Walks loose objects only: commit → checkpoint-manifest → tensor-manifests. Re-hashes each. | Structural corruption, broken DAG links | Milliseconds |
-| `verify` (default) | The above, plus for every referenced chunk: pack index lookup, `pread`, compare the 8-byte stored-payload checksum. **No decompression.** | Bit-rot, truncation, a damaged pack | Sequential read of the referenced packs |
-| `verify --deep` | The above, plus decompress every chunk and check its full 32-byte content hash. | **Malicious block injection** — a crafted payload with a valid stored checksum | + zstd decompress (~1–2 GB/s/core, 24 cores available) |
+| `--shallow` | Walks loose objects only: commit → checkpoint-manifest → tensor-manifests, re-hashing each; probes that every chunk reference exists. | Structural corruption, broken DAG links | 0.05 s |
+| `--fast` | + for every referenced chunk: index lookup, `pread`, compare the 8-byte stored-payload checksum. **No decompression.** | Bit-rot, truncation, a damaged pack | 0.19 s, 694 MiB/s |
+| **default** (`--deep`) | + decompress every chunk and check its full 32-byte content hash against `chunks[].object`. | **Malicious block injection** | 0.54 s, 239 MiB/s |
+| `--content` | + reconstruct every tensor and check its manifest's `content_hash`. | A permutation applied in the wrong order | 2.03 s, 64 MiB/s |
 
-**Be precise about this distinction in the README and the Q&A.** The default tier
-cannot catch malicious substitution: an attacker who rewrites a pack can compute a
-matching stored-payload checksum for their own bytes. Only the content hash defends
-against that, and only `--deep` checks it. The PS's threat model (§2.b) names *both*
-bit-rot and malicious block injection, so claiming the default tier covers both would
-be wrong and is exactly the kind of thing a judge will probe.
+Deep costs 2.8× the checksum tier and still finishes a 25-commit history in half a
+second, which is what settled the open question the draft left here.
 
-In practice `--deep` is cheap here, because the DAG references *residual* blocks, not a
-14 GB materialized model. `OPEN QUESTION` — measure it and decide whether `--deep`
-should simply be the default.
+`--content` is deliberately *not* folded into the default. It is the only check that
+requires **reconstruction** — a residual chunk must be applied to its base, so cost
+scales with the reconstructed model, not with stored bytes. Deep hashes the
+*decompressed stream* instead (the exact bytes `_finish` hashed), which needs no base
+and no recursion. That is why deep stays O(stored bytes) and `--content` does not.
+
+---
+
+## 12B. Why the content tier must be the default
+
+The tiers are usually described as increasing amounts of work. That framing is wrong
+and it hid a real bug in the earlier default. What actually changes between tiers is
+**whose hash you are trusting.**
+
+PS §2.c fixes the root of trust: *"Trust is rooted at a locally accepted commit/ref
+ID."* Everything else must be derived from it by walking down:
+
+```
+ref  (trusted by assumption)
+ └─ commit hash             → re-hash the commit's bytes
+     └─ checkpoint_manifest → re-hash
+         ├─ header_object   → re-hash
+         └─ tensor_manifest → re-hash
+             └─ chunks[].object → decompress the payload, re-hash
+```
+
+Against that chain:
+
+- **`--shallow`** is *parent-anchored* — sound, but covers only metadata.
+- **`--fast`** is *index-anchored*. The index is a file an attacker rewrites alongside
+  the payload. Self-certifying, therefore a rot scan and nothing more.
+- **default** is parent-anchored again, now all the way down to bytes.
+
+So the content tier is not "fast plus extra." It is **shallow's trust chain extended to
+completion**; the checksum tier hangs off a different anchor entirely and is a detour,
+not a step along the way.
+
+The earlier framing — that the default tier merely "cannot detect a crafted payload
+carrying a matching stored checksum" — undersold the gap badly. It implies the weakness
+is an 8-byte collision, i.e. 2⁶⁴ work, i.e. not a real attack. The actual weakness is
+that **every** checksum below the manifest level is attacker-writable:
+
+1. Rewrite a chunk payload → recompute the index entry's 8-byte checksum
+2. → recompute the index trailer
+3. → recompute the pack trailer
+
+All three now agree. `tests/test_verify.py` does exactly this and asserts that
+`verify --fast --packs` reports **clean** on the tampered repo, while the default tier
+names the substituted block, its pack, and the tensor and row range that reference it.
+That pair of tests is the demonstration; the prose above is only its explanation.
+
+Two consequences worth stating plainly:
+
+- **`--packs` is not a security control.** Re-hashing a pack against its own trailer
+  proves internal consistency, which the attacker ensured. It is off by default because
+  at the content tier every referenced byte already has a stronger check, so it only
+  covers framing and unreferenced regions at double the read volume.
+- **Verification never repairs.** `PackSet` rebuilds a missing or unreadable index on
+  open by default. `verify` disables that, because repairing the artifact under
+  inspection and then reporting OK would make the command worthless.
 
 ---
 

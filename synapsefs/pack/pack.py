@@ -59,6 +59,11 @@ __all__ = [
     "PackWriter",
     "scan_pack",
 ]
+"""
+def has_chunk(hash: str) -> bool
+def get_chunk_data_location(hash: str) -> str, int, int:
+def pack_chunks(chunks: list[str]) -> bool:
+"""
 
 MAGIC = b"SYNPACK\0"
 VERSION = 1
