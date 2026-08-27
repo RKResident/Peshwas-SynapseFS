@@ -38,6 +38,7 @@ __all__ = [
     "zigzag",
     "unzigzag",
     "dtype_spec",
+    "plain_stream",
     "RAW",
     "RAW_ZSTD",
     "DELTA",
@@ -386,6 +387,42 @@ def encode_chunk(
     return encoded
 
 
+def plain_stream(
+    encoding: str,
+    payload: bytes,
+    *,
+    decompressor: Optional[zstd.ZstdDecompressor] = None,
+) -> bytes:
+    """Undo only the *compression* layer of a stored chunk.
+
+    Returns the exact byte string `_finish` hashed to produce the chunk's
+    `content_hash` -- the zigzag residual for `delta-zigzag-zstd`, the raw
+    tensor bytes for the two `raw` encodings. Nothing is decoded, reshaped or
+    added to a base.
+
+    Split out of `decode_chunk` for `verify --deep`, which needs to answer
+    "are these the bytes this chunk claims to be?" and nothing else. Doing
+    that through `decode_chunk` would be wrong twice over: a residual chunk
+    would demand its base rows, dragging the whole reconstruction chain into
+    a check that does not need it, and the array it returns is a
+    *reinterpretation* of the stream, so hashing it would re-derive the same
+    bytes by a longer route. Hashing the stream directly keeps deep
+    verification O(stored bytes) with no recursion.
+
+    Raises ValueError on an unknown encoding.
+    """
+    if encoding == RAW:
+        return payload
+    if encoding in (RAW_ZSTD, DELTA):
+        if decompressor is None:
+            decompressor = zstd.ZstdDecompressor()
+        return decompressor.decompress(payload)
+    raise ValueError(
+        f"unknown chunk encoding {encoding!r}; expected one of "
+        f"{RAW!r}, {RAW_ZSTD!r}, {DELTA!r}"
+    )
+
+
 def decode_chunk(
     encoding: str,
     payload: bytes,
@@ -413,17 +450,7 @@ def decode_chunk(
     width, kind = dtype_spec(dtype)
     unsigned = _UINT_OF[width]
 
-    if encoding == RAW:
-        stream = payload
-    elif encoding in (RAW_ZSTD, DELTA):
-        if decompressor is None:
-            decompressor = zstd.ZstdDecompressor()
-        stream = decompressor.decompress(payload)
-    else:
-        raise ValueError(
-            f"unknown chunk encoding {encoding!r}; expected one of "
-            f"{RAW!r}, {RAW_ZSTD!r}, {DELTA!r}"
-        )
+    stream = plain_stream(encoding, payload, decompressor=decompressor)
 
     if encoding in (RAW, RAW_ZSTD):
         return np.frombuffer(stream, dtype=unsigned)
