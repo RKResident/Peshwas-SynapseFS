@@ -1,5 +1,4 @@
-test_src/
-test_dst/
-spp
-tcp_test
+cpp/test_src/
+cpp/test_dst/
+cpp/spp
 
