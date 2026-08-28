@@ -1,0 +1,36 @@
+[project]
+name = "synapsefs"
+version = "0.1.0"
+description = "Permutation-aware, cryptographically verifiable version control and virtual filesystem for neural network checkpoints"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "safetensors>=0.4",
+    "zstandard>=0.22",
+    "blake3>=1.0",
+    "pyfuse3>=3.3",
+    "trio>=0.24",
+]
+
+[project.optional-dependencies]
+# torch is TEST-ONLY on purpose. It is used to prove the mount works against
+# `safetensors.torch.load_file()`, and must never be imported by the daemon --
+# it costs hundreds of MB of RSS against a graded peak-RSS metric.
+dev = ["pytest>=8.0", "torch>=2.0"]
+
+[project.scripts]
+synapsefs = "synapsefs.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["synapsefs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: exercises a real subprocess kill (SIGKILL) -- correct but slower; skip with -m \"not slow\"",
+]
