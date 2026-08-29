@@ -281,7 +281,13 @@ def _align(store, checkpoint: Path, base_source, config_path: Path,
     try:
         topo = config_parser.parse(refs, config)
         result = solver.align_checkpoints(
-            base_source, str(checkpoint), topo, no_align=no_align
+            base_source, str(checkpoint), topo, no_align=no_align,
+            # The residual pass exists to decide whether a solved permutation
+            # actually helped. Under --no-align there is no permutation, so it
+            # measures nothing and costs a full fp16->fp32 upcast of both
+            # checkpoints plus float64 norms per tensor -- 42s of CPU on a
+            # 176 MiB model, for a number nothing reads.
+            measure=not no_align,
         )
     except AlignError as exc:
         notes.append(f"alignment skipped: {exc}")
