@@ -58,7 +58,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Union
 
 import numpy as np
 
-from synapsefs.codec.chunk import DELTA, encode_chunk
+from synapsefs.codec.chunk import DEFAULT_LEVEL, encode_chunk, is_delta
 from synapsefs.safetensors_io import SafetensorsFile, TensorSpec
 
 # What this module needs from a base checkpoint, and all it needs: three
@@ -170,6 +170,7 @@ def _manifest_dict(
     chunks: List[dict],
     base_manifest_hash: Optional[str],
     content_hash: str,
+    perm: "Optional[TensorPermutation]" = None,
 ) -> dict:
     return {
         "name": spec.name,
@@ -206,12 +207,12 @@ def _manifest_dict(
         # forces GC to retain that whole subtree to satisfy a link nobody
         # reads. The caller enforces the second direction (see `any_delta`).
         "base_tensor_manifest": base_manifest_hash,
-        # Non-identity alignment is the alignment team's job; this module
-        # only ever chunks a target against the base's own row order, so
-        # both permutations are identity (null) and column blocking is 1.
-        "base_row_permutation": None,
-        "base_col_permutation": None,
-        "col_block_size": 1,
+        # Hashes of the stored permutation objects, or null for identity.
+        # A residual is unreadable without these: the reconstructor has to
+        # repeat the same gather the encoder did.
+        "base_row_permutation": perm.row_object if perm else None,
+        "base_col_permutation": perm.col_object if perm else None,
+        "col_block_size": perm.col_block_size if perm else 1,
         "chunks": chunks,
     }
 
@@ -246,6 +247,63 @@ def _base_rows_source(
     return base
 
 
+@dataclass(frozen=True)
+class TensorPermutation:
+    """How to bring one tensor's base into the target's ordering.
+
+    **Direction (FORMAT.md 8, ARCHITECTURE.md 2.4): `row[i]` is the BASE index
+    that TARGET index `i` was diffed against**, so the base is gathered as
+    `base[row]`. Never the inverse. Both directions are valid bijections of the
+    right length, so nothing structural catches a reversal -- only the tensor
+    `content_hash` does.
+
+    `row_object` / `col_object` are the hashes of the stored permutation
+    objects, already written by the caller. They are carried here rather than
+    stored from inside this module because writing objects is the store's job,
+    not the codec's; this module only ever emits chunks through `emit`.
+    """
+
+    row: "Optional[np.ndarray]" = None
+    col: "Optional[np.ndarray]" = None
+    col_block_size: int = 1
+    row_object: Optional[str] = None
+    col_object: Optional[str] = None
+
+    @property
+    def identity(self) -> bool:
+        return self.row is None and self.col is None
+
+
+def apply_col_perm(block: np.ndarray, perm: "Optional[np.ndarray]", size: int) -> np.ndarray:
+    """Reorder column *blocks* of an already-fetched 2-D row block.
+
+    Columns move in contiguous groups of `size`: after a conv->linear flatten,
+    output channel `c` owns columns `[c*size, (c+1)*size)`. Operates on raw bit
+    patterns, which is safe because a permutation is an index gather and never
+    looks at the values.
+
+    Column permutation never crosses a chunk boundary -- chunks are row ranges,
+    and this reorders within each row -- so unlike the row permutation it costs
+    nothing extra to fetch.
+    """
+    if perm is None:
+        return block
+    rows, cols = block.shape
+    return block.reshape(rows, cols // size, size)[:, perm, :].reshape(rows, cols)
+
+
+def _aligned_base_rows(base_source, name, row_start, row_stop, perm):
+    """The base rows that target rows `[row_start, row_stop)` diff against."""
+    if perm is None or perm.row is None:
+        block = base_source.rows(name, row_start, row_stop)
+    else:
+        # Scattered: target row i came from base row perm.row[i].
+        block = base_source.gather_rows(name, perm.row[row_start:row_stop])
+    if perm is not None:
+        block = apply_col_perm(block, perm.col, perm.col_block_size)
+    return block
+
+
 def encode_checkpoint(
     target_path: PathLike,
     base: "Optional[PathLike | BaseSource]" = None,
@@ -256,7 +314,8 @@ def encode_checkpoint(
     already_have: Optional[Callable[[bytes], bool]] = None,
     compress_raw: bool = True,
     allow_raw_fallback: bool = True,
-    level: int = 3,
+    level: int = DEFAULT_LEVEL,
+    alignment: Optional[Dict[str, TensorPermutation]] = None,
 ) -> CheckpointResult:
     """Chunk, encode, and dedup every tensor in `target_path` against
     `base` (or against nothing, for a root commit), building the
@@ -352,6 +411,12 @@ def encode_checkpoint(
                 else None
             )
 
+            # Identity when the tensor is stored raw: a permutation is only
+            # meaningful relative to a base, and there is none.
+            perm = (alignment or {}).get(name) if base_source is not None else None
+            if perm is not None and perm.identity:
+                perm = None
+
             row_nbytes = spec.row_elems * spec.width
             chunk_entries: List[dict] = []
             unchanged = False
@@ -387,7 +452,9 @@ def encode_checkpoint(
 
                     target_rows = target.rows(name, row_start, row_stop)
                     base_rows = (
-                        base_source.rows(name, row_start, row_stop)
+                        _aligned_base_rows(
+                            base_source, name, row_start, row_stop, perm
+                        )
                         if base_source is not None
                         else None
                     )
@@ -412,6 +479,17 @@ def encode_checkpoint(
                             "row_end": row_end,
                             "encoding": encoded.encoding,
                             "object": encoded.content_hash.hex(),
+                            # Both used to live in the pack index. With loose
+                            # chunks they have to move here -- and moving
+                            # `stored_checksum` in particular is an upgrade,
+                            # not a compromise: in the manifest it is covered
+                            # by the commit hash, so `verify --fast` becomes
+                            # ref-anchored and detects substitution, not just
+                            # rot (ARCHITECTURE.md 4.5.2).
+                            #
+                            # `stored_len` did NOT move: it is stat().st_size.
+                            "plain_len": encoded.plain_len,
+                            "stored_checksum": encoded.stored_checksum.hex(),
                         }
                     )
                     record = ChunkRecord(
@@ -443,12 +521,29 @@ def encode_checkpoint(
                     # retained bytes to one chunk regardless of checkpoint
                     # size.
 
-                unchanged = still_identical and bool(chunk_entries)
+                # `perm is None` is load-bearing, not defensive.
+                #
+                # FORMAT.md 4.5's reuse rule points an unchanged tensor at the
+                # *base's* tensor-manifest instead of writing a new one. Under
+                # a non-identity permutation that is wrong in a way nothing
+                # else catches: the chunks really are identical -- but only
+                # *after* gathering the base through the permutation, so the
+                # tensor's actual content is a reordering of the base's, not a
+                # copy of it. Reusing the base's manifest would claim the two
+                # tensors have the same content_hash, and reconstruction would
+                # then faithfully reproduce the *base's* row order.
+                #
+                # It is self-consistent, so `verify --content` passes; only a
+                # byte-comparison against the original file catches it. Found
+                # exactly that way.
+                unchanged = (
+                    still_identical and bool(chunk_entries) and perm is None
+                )
                 # Invariant: a base pointer is only meaningful if at least one
                 # chunk actually references it. The per-chunk raw fallback can
                 # take every chunk of a tensor, which would otherwise leave a
                 # base pointing at nothing.
-                if not any(c["encoding"] == DELTA for c in chunk_entries):
+                if not any(is_delta(c["encoding"]) for c in chunk_entries):
                     base_manifest_hash = None
 
                 if not unchanged:
@@ -467,7 +562,7 @@ def encode_checkpoint(
             else:
                 manifests[name] = _manifest_dict(
                     spec, chunk_entries, base_manifest_hash,
-                    content_digest.hexdigest(),
+                    content_digest.hexdigest(), perm,
                 )
 
     return CheckpointResult(

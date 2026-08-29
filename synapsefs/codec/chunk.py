@@ -39,16 +39,58 @@ __all__ = [
     "unzigzag",
     "dtype_spec",
     "plain_stream",
+    "is_delta",
+    "shuffle",
+    "unshuffle",
     "RAW",
     "RAW_ZSTD",
     "DELTA",
+    "RAW_SHUFFLE_ZSTD",
+    "DELTA_SHUFFLE",
 ]
 
 RAW = "raw"
 RAW_ZSTD = "raw-zstd"
 DELTA = "delta-zigzag-zstd"
 
-DEFAULT_LEVEL = 3
+# Current encodings. The shuffle is part of the *stream definition* here, not a
+# compressor setting (see `shuffle`), so these carry their own names rather
+# than a flag on the old ones. The two names above are legacy: they still
+# decode, they are simply never written any more.
+#
+# `delta-shuffle-zstd` differs from the legacy `delta-zigzag-zstd` in two ways,
+# both measured: it has no zigzag step (shuffle subsumes it, see `zigzag`) and
+# no monotone key (see `to_monotone_key`). Its residual is a plain modular
+# subtraction of raw bit patterns.
+RAW_SHUFFLE_ZSTD = "raw-shuffle-zstd"
+DELTA_SHUFFLE = "delta-shuffle-zstd"
+
+#: Encodings whose stream is byte-shuffled and must be un-shuffled after
+#: decompression. Consulted by `decode_chunk`, never by `plain_stream`.
+_SHUFFLED = frozenset({RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE})
+
+_ZSTD_FRAMED = frozenset({RAW_ZSTD, DELTA, RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE})
+_DELTA_ENCODINGS = frozenset({DELTA, DELTA_SHUFFLE})
+
+
+def is_delta(encoding: str) -> bool:
+    """Whether this encoding is a residual and therefore needs a base.
+
+    Call this rather than comparing against `DELTA` directly -- there are two
+    residual encodings now, and a bare `== DELTA` silently treats a shuffled
+    residual as self-contained.
+    """
+    return encoding in _DELTA_ENCODINGS
+
+# zstd level 1, not 3. Compression is *non-monotone* in level on byte-shuffled
+# residuals: levels 1-2 use zstd's `fast`/`dfast` match-finders, 3+ switch to
+# `greedy`/`lazy`, and on long runs of near-identical high bytes the fast
+# strategies find the long matches immediately while the lazy ones hunt for
+# better matches that do not exist and emit more literals. Measured across five
+# checkpoint pairs, level 1 is 0.8pp *smaller* than level 3 and ~2x faster to
+# compress. Decompression is ~1.2 GB/s at every level, so the read path does
+# not care.
+DEFAULT_LEVEL = 1
 
 # Key kinds. Which order-preserving map applies depends on how the dtype lays
 # out its sign, not on how wide it is -- so width and kind are tracked apart.
@@ -137,12 +179,22 @@ def _consts(width: int):
 
 
 def to_monotone_key(bits: np.ndarray, kind: str) -> np.ndarray:
-    """Map raw bit patterns to keys whose unsigned ordering matches the
-    dtype's value ordering, so that a small change in value is a small change
-    in key -- which is the entire reason the delta in step 2 compresses.
+    """Map raw float bits to an integer that sorts in the same order as the float.
 
-    Operates on the array's own width; `bits` must already be an unsigned
-    array of the right element width (see `_as_bits`).
+    **No longer used by the codec.** Retained for two consumers: decoding the
+    legacy `delta-zigzag-zstd` encoding, and `materialize.compare_sources`,
+    which uses the integer distance between two keys as a ULP distance -- the
+    scale-free way to say "these differ by one representable step".
+
+    Why it left the encode path: floats are stored sign-magnitude, so negative
+    bit patterns run backwards, and this map (`bits ^ 0x8000` when positive,
+    `~bits` when negative) makes integer order match numeric order. That
+    matters for the 3-5%% of weights that cross zero between checkpoints. But a
+    plain modular subtraction of raw bits is *also* exactly reversible, and
+    measured across all adjacent pairs the key is worth only +0.07pp -- while
+    costing 0.26/0.47/0.66pp at gaps 2/3/4, which is what the star topology
+    actually produces. Weighted, dropping it wins ~0.22pp and removes the
+    FLOAT/SINT distinction from the storage path entirely.
     """
     zero, _one, msb, shift = _consts(bits.dtype.itemsize)
     return bits ^ _mask_forward(bits, kind, msb, zero, shift)
@@ -235,6 +287,20 @@ class EncodedChunk:
     up a stream length that has started to diverge.
     """
 
+    stored_checksum: bytes = b""
+    """First 8 bytes of blake3 of the **stored** payload.
+
+    Hashes different bytes than `content_hash`, which covers the uncompressed
+    stream: this one answers "did these bytes rot or get substituted?" and is
+    checkable without decompressing. It goes into the tensor-manifest, where
+    being covered by the commit hash makes it ref-anchored -- which is what
+    upgrades `verify --fast` from a rot scan to real tamper detection
+    (ARCHITECTURE.md 4.5.2).
+
+    Computed here rather than by the caller because this is where the real
+    payload bytes exist, unwrapped.
+    """
+
     is_identical: bool = False
     """True when this chunk's content was byte-identical to its base chunk.
 
@@ -277,6 +343,35 @@ def _as_bits(arr: np.ndarray, width: int, role: str) -> np.ndarray:
     return a.view(_UINT_OF[width]).reshape(-1)
 
 
+def shuffle(stream: bytes, width: int) -> bytes:
+    """Group byte 0 of every element, then byte 1, and so on.
+
+    A residual stream is `width`-byte little-endian integers whose values are
+    almost all small -- the median zigzag delta between consecutive training
+    epochs is around 300, so the high byte of nearly every element is 0 or 1.
+    Interleaved, those near-constant bytes sit between noisy low bytes and zstd
+    cannot see the pattern. Transposed, they form one long run.
+
+    Measured on real epoch-to-epoch residuals: 77.94% -> 72.10% for the delta
+    stream and 92.02% -> 85.11% for raw, at zstd level 3.
+
+    This is the same transform blosc2 calls SHUFFLE. blosc2's BITSHUFFLE (a
+    bit-plane split rather than a byte transpose) measured *worse* here --
+    73.79% -- so the finer version is not the better one for this data.
+
+    `width` must divide `len(stream)`, which holds by construction: a stream is
+    always a whole number of elements.
+    """
+    a = np.frombuffer(stream, dtype=np.uint8)
+    return a.reshape(-1, width).T.copy().tobytes()
+
+
+def unshuffle(stream: bytes, width: int) -> bytes:
+    """Exact inverse of `shuffle`."""
+    a = np.frombuffer(stream, dtype=np.uint8)
+    return a.reshape(width, -1).T.copy().tobytes()
+
+
 def _finish(
     encoding: str,
     stream: bytes,
@@ -290,6 +385,7 @@ def _finish(
         payload=payload,
         plain_len=len(stream),
         original_len=original_len,
+        stored_checksum=blake3.blake3(payload).digest()[:8],
         is_identical=is_identical,
     )
 
@@ -348,9 +444,15 @@ def encode_chunk(
 
     def encode_raw() -> EncodedChunk:
         stream = t_bits.tobytes()
-        if compress_raw:
-            return _finish(RAW_ZSTD, stream, compressor.compress(stream), original_len)
-        return _finish(RAW, stream, stream, original_len)
+        if not compress_raw:
+            return _finish(RAW, stream, stream, original_len)
+        # The hash covers the shuffled stream -- i.e. exactly the bytes handed
+        # to the compressor -- which keeps the existing rule that a chunk's
+        # identity is its *uncompressed* content, and keeps `plain_stream`
+        # (and therefore `verify --deep`) a pure decompression step.
+        stream = shuffle(stream, width)
+        return _finish(RAW_SHUFFLE_ZSTD, stream, compressor.compress(stream),
+                       original_len)
 
     if base is None:
         return encode_raw()
@@ -365,14 +467,24 @@ def encode_chunk(
         )
     b_bits = _as_bits(base, width, "base")
 
-    delta = to_monotone_key(t_bits, kind) - to_monotone_key(b_bits, kind)
+    # Subtract the raw bit patterns. No monotone key: measured across all 24
+    # adjacent pairs it is worth +0.07pp, and it *loses* 0.26/0.47/0.66pp at
+    # gaps 2/3/4 -- the gaps the star actually produces -- for a weighted
+    # -0.22pp. See `to_monotone_key` for what it did and why it stopped paying.
+    delta = t_bits - b_bits
     # An all-zero delta means the chunk is byte-identical to its base. Computed
     # from the delta rather than from the encoding that wins below, because it
     # is a fact about the *content*, not about how it ended up stored.
     is_identical = not delta.any()
-    stream = zigzag(delta).tobytes()
+    # No zigzag. Byte shuffle subsumes it: without zigzag the high byte of each
+    # element carries the *sign* of the drift (0x00 or 0xff), which is locally
+    # correlated in a trained network and so compresses into long runs. Zigzag
+    # replaces that with magnitude, which varies element to element and shatters
+    # the runs -- measured mean run length 1.71 -> 1.59, costing 0.6-0.8pp.
+    stream = shuffle(delta.astype(t_bits.dtype).tobytes(), width)
     encoded = _finish(
-        DELTA, stream, compressor.compress(stream), original_len, is_identical
+        DELTA_SHUFFLE, stream, compressor.compress(stream), original_len,
+        is_identical,
     )
 
     if allow_raw_fallback:
@@ -396,9 +508,9 @@ def plain_stream(
     """Undo only the *compression* layer of a stored chunk.
 
     Returns the exact byte string `_finish` hashed to produce the chunk's
-    `content_hash` -- the zigzag residual for `delta-zigzag-zstd`, the raw
-    tensor bytes for the two `raw` encodings. Nothing is decoded, reshaped or
-    added to a base.
+    `content_hash` -- for the shuffled encodings that is the *shuffled* stream,
+    because the shuffle happens before hashing. Nothing is decoded, reshaped,
+    un-shuffled or added to a base.
 
     Split out of `decode_chunk` for `verify --deep`, which needs to answer
     "are these the bytes this chunk claims to be?" and nothing else. Doing
@@ -413,13 +525,14 @@ def plain_stream(
     """
     if encoding == RAW:
         return payload
-    if encoding in (RAW_ZSTD, DELTA):
+    if encoding in _ZSTD_FRAMED:
         if decompressor is None:
             decompressor = zstd.ZstdDecompressor()
         return decompressor.decompress(payload)
     raise ValueError(
         f"unknown chunk encoding {encoding!r}; expected one of "
-        f"{RAW!r}, {RAW_ZSTD!r}, {DELTA!r}"
+        f"{RAW!r}, {RAW_ZSTD!r}, {DELTA!r}, {RAW_SHUFFLE_ZSTD!r}, "
+        f"{DELTA_SHUFFLE!r}"
     )
 
 
@@ -451,19 +564,26 @@ def decode_chunk(
     unsigned = _UINT_OF[width]
 
     stream = plain_stream(encoding, payload, decompressor=decompressor)
+    if encoding in _SHUFFLED:
+        stream = unshuffle(stream, width)
 
-    if encoding in (RAW, RAW_ZSTD):
+    if encoding in (RAW, RAW_ZSTD, RAW_SHUFFLE_ZSTD):
         return np.frombuffer(stream, dtype=unsigned)
 
     if base is None:
         raise ValueError(f"{DELTA} chunk cannot be decoded without a base chunk")
     b_bits = _as_bits(base, width, "base")
 
-    zz = np.frombuffer(stream, dtype=unsigned)
-    if zz.size != b_bits.size:
+    residual = np.frombuffer(stream, dtype=unsigned)
+    if residual.size != b_bits.size:
         raise ValueError(
-            f"residual has {zz.size} elements but base chunk has {b_bits.size}"
+            f"residual has {residual.size} elements but base chunk has {b_bits.size}"
         )
 
-    target_key = to_monotone_key(b_bits, kind) + unzigzag(zz)
-    return from_monotone_key(target_key, kind)
+    if encoding == DELTA:
+        # Legacy: this encoding's residual is a zigzag over *monotone keys*,
+        # so it has to be undone in that space.
+        return from_monotone_key(
+            to_monotone_key(b_bits, kind) + unzigzag(residual), kind
+        )
+    return (b_bits + residual).astype(unsigned)

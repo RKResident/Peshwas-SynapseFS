@@ -22,13 +22,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import json
+
 from synapsefs import graph
+from synapsefs.align import config_parser, lap, report as align_report, solver
+from synapsefs.align.Error import AlignError
+from synapsefs.align.IR import TensorRef
 from synapsefs.cli import output
+from synapsefs.codec.checkpoint import TensorPermutation
 from synapsefs.codec.checkpoint import encode_checkpoint
-from synapsefs.errors import UsageError
-from synapsefs.pack.index import write_index
-from synapsefs.pack.pack import PackWriter
-from synapsefs.pack.packset import PackSet
+from synapsefs.errors import NotAlignableError, UsageError
 from synapsefs.store.repo import Repo
 
 
@@ -138,7 +141,6 @@ def run(args: argparse.Namespace) -> dict:
         )
 
     store = repo.store
-    pack_dir = repo.objects_dir / "pack"
     tmp_dir = repo.objects_dir / "tmp"
 
     # FORMAT.md 12A: commits form a star, not a chain.
@@ -163,37 +165,40 @@ def run(args: argparse.Namespace) -> dict:
     )
     store_full = anchor is None or since_full >= graph.REBASE_INTERVAL - 1
 
-    with PackSet(pack_dir, tmp_dir=tmp_dir) as packs:
-        base_source = (
-            None if store_full
-            else graph.CommitCheckpoint(store, packs, anchor)
+    notes: list = []
+    base_source = (
+        None if store_full else graph.CommitCheckpoint(store, anchor)
+    )
+
+    alignment, align_result = _align(
+        store, checkpoint, base_source, config_path,
+        no_align=args.no_align, notes=notes,
+    )
+    if args.strict and align_result is not None and align_result.not_alignable:
+        raise NotAlignableError(
+            f"{len(align_result.not_alignable)} tensor(s) not meaningfully "
+            f"alignable: {', '.join(align_result.not_alignable[:5])}"
+            + (" ..." if len(align_result.not_alignable) > 5 else "")
         )
 
-        with PackWriter(pack_dir, tmp_dir=tmp_dir) as writer:
-            encoded = encode_checkpoint(
-                checkpoint,
-                base_source,
-                emit=writer.add_record,
-                # Without these the manifests would record residual chunks
-                # with no base to decode them against.
-                base_manifests=(
-                    None if base_source is None
-                    else base_source.tensor_manifest_hashes()
-                ),
-                # Cross-commit dedup: a chunk already in any pack is counted,
-                # referenced by the manifest, and not written again.
-                already_have=packs.has,
-                **({} if args.chunk_size is None
-                   else {"chunk_size_bytes": args.chunk_size}),
-            )
-
-        write_index(
-            pack_dir / f"{writer.pack_hash.hex()}.idx",
-            pack_hash=writer.pack_hash,
-            entries=writer.entries,
-            tmp_dir=tmp_dir,
-        )
-        packs.register(writer.pack_hash)
+    # Chunks are loose, content-addressed objects like everything else
+    # (ARCHITECTURE.md 3.3). Each lands atomically and independently, so a
+    # crash leaves valid reusable chunks rather than a half-written container
+    # that has to be discarded -- and `already_have` is a stat, not an index
+    # probe.
+    encoded = encode_checkpoint(
+        checkpoint,
+        base_source,
+        emit=lambda record: store.put_at(record.content_hash.hex(), record.payload),
+        base_manifests=(
+            None if base_source is None
+            else base_source.tensor_manifest_hashes()
+        ),
+        already_have=lambda content_hash: store.has(content_hash.hex()),
+        alignment=alignment,
+        **({} if args.chunk_size is None
+           else {"chunk_size_bytes": args.chunk_size}),
+    )
 
     topology_config_hash = _resolve_config(store, config_path, base_hash)
 
@@ -236,13 +241,87 @@ def run(args: argparse.Namespace) -> dict:
         "chunks_deduped": encoded.chunks_deduped,
         "manifests_reused": objects.reused_tensor_manifests,
         "tensors_unchanged": len(encoded.reused_manifests),
-        # Alignment is not implemented yet: every commit currently diffs
-        # against the base's own row order, i.e. an identity permutation.
-        # `--no-align` and `--strict` are accepted and parsed but cannot
-        # change that until the alignment engine lands.
-        "alignment": {"groups": 0, "identity": True},
-        "notes": encoded.notes,
+        "alignment": (
+            align_result.as_json() if align_result is not None
+            else {"groups": 0, "identity": True}
+        ),
+        "notes": encoded.notes + notes,
     }
+
+
+def _align(store, checkpoint: Path, base_source, config_path: Path,
+           *, no_align: bool, notes: list):
+    """Solve the permutation between `base_source` and `checkpoint`.
+
+    Returns `(alignment, result)` where `alignment` maps tensor name ->
+    `TensorPermutation` with its permutation objects already stored, and
+    `result` is the solver's report (or None if alignment did not run).
+
+    Degrades rather than fails. A checkpoint this parser cannot describe --
+    attention blocks, an unrecognised layer chain -- still commits, just with
+    an identity permutation, and says so in `notes`. Refusing to store a
+    checkpoint because we could not *optimise* it would be the wrong trade.
+    `--strict` is what turns a degraded alignment into an error.
+    """
+    if base_source is None:
+        return None, None
+
+    refs = {}
+    for name in base_source.names():
+        spec = base_source.spec(name)
+        refs[name] = TensorRef(name=name, shape=tuple(spec.shape), dtype=spec.dtype)
+
+    config = None
+    if config_path.is_file():
+        try:
+            config = json.loads(config_path.read_text())
+        except ValueError:
+            notes.append(f"{config_path.name}: not valid JSON, ignored for alignment")
+
+    try:
+        topo = config_parser.parse(refs, config)
+        result = solver.align_checkpoints(
+            base_source, str(checkpoint), topo, no_align=no_align
+        )
+    except AlignError as exc:
+        notes.append(f"alignment skipped: {exc}")
+        return None, None
+
+    alignment = {}
+    skipped = 0
+    for name, ta in result.tensors.items():
+        if ta.identity:
+            continue
+        # Only apply a permutation that actually *reduced* the residual.
+        #
+        # The solver maximises the weight-matching objective, which is not the
+        # same thing as minimising the residual. Between two consecutive epochs
+        # of one training run the correct answer is identity, but early in
+        # training the weights move enough that some other matching can score
+        # higher on the objective while making the delta *larger*. Applying it
+        # then costs compression for nothing -- measured at 83.24% against
+        # 76.44% for identity on epoch 1 -> 2.
+        #
+        # `Assessment.helped` is exactly this test (post < pre), already
+        # computed by the residual pass, so the gate is free.
+        verdict = result.assessments.get(name)
+        if verdict is not None and not verdict.helped:
+            skipped += 1
+            continue
+        alignment[name] = TensorPermutation(
+            row=ta.pi_row,
+            col=ta.pi_col,
+            col_block_size=ta.col_block_size,
+            # Identity is stored as null and gets no object (FORMAT.md 4.2).
+            row_object=None if ta.pi_row is None else store.put(lap.pack(ta.pi_row)),
+            col_object=None if ta.pi_col is None else store.put(lap.pack(ta.pi_col)),
+        )
+    if skipped:
+        notes.append(
+            f"{skipped} tensor(s) kept at identity: the solved permutation did "
+            f"not reduce the residual"
+        )
+    return (alignment or None), result
 
 
 def _resolve_config(store, config_path: Path, base_hash: Optional[str]) -> Optional[str]:

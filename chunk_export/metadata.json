@@ -1,0 +1,24 @@
+{
+  "tensor": "blocks.1.conv1.weight",
+  "commit": "368482ed5e17e3d5332a91aadee169cf35273f2d90f28f4e25979ffdb1351d03",
+  "message": "epoch 24",
+  "chunk_hash": "062d3e8b2ab1d49a2e5d84b29d0abbed118d3a6b0f3623b44431ca38ad226016",
+  "encoding": "delta-shuffle-zstd",
+  "dtype": "F16",
+  "shape": [
+    192,
+    96,
+    3,
+    3
+  ],
+  "rows": [
+    0,
+    191
+  ],
+  "element_width_bytes": 2,
+  "elements": 165888,
+  "plain_len": 331776,
+  "stored_checksum": "3cee9bb06dbfdc26",
+  "base_tensor_manifest": "f88084d111dac8f63c5607c52d6b1808b16ad2db465bdc542bc51a29fdabd4ff",
+  "note": "3_deltas.bin holds uint16 little-endian modular differences: target_bits - base_bits mod 2^16. Add them back to the base's bit patterns to reconstruct. They are NOT weights."
+}

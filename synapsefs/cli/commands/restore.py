@@ -32,7 +32,6 @@ from synapsefs import graph
 from synapsefs.cli import output
 from synapsefs.errors import IntegrityError, UsageError
 from synapsefs.materialize import compare_sources, materialize
-from synapsefs.pack.packset import PackSet
 from synapsefs.safetensors_io import SafetensorsFile
 from synapsefs.store.repo import Repo
 
@@ -97,33 +96,30 @@ def run(args: argparse.Namespace) -> dict:
     comparisons: List[dict] = []
     identical_bytes: Optional[bool] = None
 
-    with PackSet(
-        repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp"
-    ) as packs:
-        source = graph.CommitCheckpoint(store, packs, commit_hash)
+    source = graph.CommitCheckpoint(store, commit_hash)
 
-        if args.out is not None:
-            written = materialize(source, source.header_bytes, Path(args.out))
+    if args.out is not None:
+        written = materialize(source, source.header_bytes, Path(args.out))
 
-        if reference is not None:
-            with SafetensorsFile(reference) as ref_file:
-                # Compared against the *live* commit, not against whatever was
-                # written above. That keeps the answer meaningful when --out
-                # was not given, and it isolates the codec from the writer: if
-                # these agree but the files below do not, the bug is in
-                # materialize(), not in the residual chain.
-                comparisons = [
-                    _as_dict(item)
-                    for item in compare_sources(source, ref_file)
-                ]
+    if reference is not None:
+        with SafetensorsFile(reference) as ref_file:
+            # Compared against the *live* commit, not against whatever was
+            # written above. That keeps the answer meaningful when --out
+            # was not given, and it isolates the codec from the writer: if
+            # these agree but the files below do not, the bug is in
+            # materialize(), not in the residual chain.
+            comparisons = [
+                _as_dict(item)
+                for item in compare_sources(source, ref_file)
+            ]
 
-            if written is not None:
-                # The stronger, end-to-end check: whole files, headers
-                # included. This is the property CLI.md ~4 actually requires,
-                # and the tensor table above cannot see a header difference.
-                identical_bytes = filecmp.cmp(
-                    Path(written["path"]), reference, shallow=False
-                )
+        if written is not None:
+            # The stronger, end-to-end check: whole files, headers
+            # included. This is the property CLI.md ~4 actually requires,
+            # and the tensor table above cannot see a header difference.
+            identical_bytes = filecmp.cmp(
+                Path(written["path"]), reference, shallow=False
+            )
 
     differing = [c for c in comparisons if c["status"] != "identical"]
     result = {

@@ -339,9 +339,9 @@ demo repos exceed ~30 commits.
   "base_col_permutation": "<permutation-object-hash>" | null,
   "col_block_size": 1,
   "chunks": [
-    {"row_start": 0,    "row_end": 511,  "encoding": "delta-zigzag-zstd", "object": "<blake3>"},
+    {"row_start": 0,    "row_end": 511,  "encoding": "delta-shuffle-zstd", "object": "<blake3>"},
     {"row_start": 512,  "row_end": 1023, "encoding": "raw-zstd",          "object": "<blake3>"},
-    {"row_start": 1024, "row_end": 1535, "encoding": "delta-zigzag-zstd", "object": "<blake3>"}
+    {"row_start": 1024, "row_end": 1535, "encoding": "delta-shuffle-zstd", "object": "<blake3>"}
   ]
 }
 ```
@@ -411,7 +411,9 @@ now lives next to `base_tensor_manifest` and is named for it.
   |---|---|
   | `raw` | Uncompressed tensor bytes. Used for base/root checkpoints so the π gather at read time is a page-cache `memcpy` rather than N decompressions. |
   | `raw-zstd` | zstd of tensor bytes, no delta. Used when `base_tensor_manifest` is null, or per-chunk when delta doesn't help. |
-  | `delta-zigzag-zstd` | The residual path — §8. |
+  | `delta-shuffle-zstd` | The residual path — §8. |
+  | `raw-shuffle-zstd` | Stored in full, byte-shuffled — §8. |
+  | `delta-zigzag-zstd`, `raw-zstd` | Legacy. Still decode; never written. |
 
   `OPEN QUESTION` — whether root checkpoints use `raw` or `raw-zstd` by default. `raw`
   makes the scattered-permutation gather cheap; `raw-zstd` saves disk (a real concern
@@ -429,7 +431,21 @@ now lives next to `base_tensor_manifest` and is named for it.
 
 ---
 
-## 8. Delta encoding (`delta-zigzag-zstd`)
+## 8. Delta encoding (`delta-shuffle-zstd`)
+
+> **REVISED 2026-08-28.** Two measured changes to this section's pipeline. A
+> **byte shuffle** was added before compression (78% -> 72%), and the **zigzag**
+> step was then removed, because shuffle and zigzag turned out to be
+> substitutes and zigzag cost 0.6-0.8pp once shuffle was in place. The default
+> zstd level dropped from 3 to **1**, which is both smaller and ~2x faster on
+> this data — compression is non-monotone in level here. The **monotone key**
+> was then removed too (worth +0.07pp at gap 1, −0.26/−0.47/−0.66pp at gaps
+> 2/3/4), so the residual is now a plain modular subtraction of raw bit
+> patterns and the `FLOAT`/`SINT` key-kind distinction has left the storage
+> path. Full measurements, plus four rejected alternatives and the one
+> principle that explains all of them, are in `ARCHITECTURE.md` §4.1. The old
+> encodings still decode.
+
 
 Given a chunk of target tensor `B` and the corresponding rows of base `A` (gathered
 through `base_row_permutation`, and column-permuted through `base_col_permutation` /
@@ -486,7 +502,7 @@ needs no headroom either.
 **4. Compress.** zstd, optionally with the pack's dictionary (§6). This produces the
 record payload.
 
-**Reconstruction** reverses each step exactly: decompress → un-zigzag
+**Reconstruction** reverses each step exactly: decompress → un-shuffle
 (`d = (zz >> 1) ^ -(zz & 1)`) → `key(B) = delta + key(A)` (native width, wrapping) →
 invert `key()` → reinterpret as the dtype. Every step is integer arithmetic on raw bit
 patterns; no float rounding occurs anywhere, which is what makes byte-exact

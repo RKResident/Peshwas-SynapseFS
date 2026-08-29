@@ -1,19 +1,18 @@
 """`synapsefs verify` -- CLI.md ~7.
 
     synapsefs verify [<ref>] [--shallow | --fast | --deep] [--content]
-                     [--packs] [--all] [--json]
+                     [--all] [--json]
 
 Walks and cryptographically verifies lineage. Independent of `checkout` and
 `mount` by construction: it talks to the object store and pack set directly,
 so integrity can be graded on a repo whose FUSE mount does not work at all.
 
-The default tier is `--deep` (FORMAT.md 12B). That is a deliberate departure
-from CLI.md's original table, which made the checksum tier the default: the
-checksum tier compares a payload against a value stored in the pack index,
-and an attacker who rewrote the payload rewrote the index too. It detects
-rot, never tampering. Since PS module 2b asks specifically for malicious
-block injection to be rejected, the tier that can actually do that is the one
-that runs when you type `synapsefs verify`.
+`--deep` is the default. Since chunks became loose objects, `--fast` is also
+ref-anchored -- its checksum lives in the tensor-manifest, which the commit
+hash covers -- so it detects substitution too, at ~2.9x the throughput.
+`--deep` stays the default because it additionally rules out a forged 8-byte
+prefix, and because it is cheap: it hashes the decompressed stream, so a
+residual chunk never needs its base.
 """
 
 from __future__ import annotations
@@ -46,9 +45,9 @@ def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
     )
     tier.add_argument(
         "--fast", action="store_true",
-        help="Above, plus each chunk's stored payload against the pack index"
-             " checksum. No decompression. Detects bit-rot only -- it cannot"
-             " detect tampering, because the index is as writable as the pack.",
+        help="Above, plus each chunk's bytes against the checksum its"
+             " tensor-manifest records. No decompression. Ref-anchored, so it"
+             " detects substitution as well as rot.",
     )
     tier.add_argument(
         "--deep", action="store_true",
@@ -61,13 +60,6 @@ def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
              " manifest's content_hash. Much slower -- this is the only check"
              " that requires reconstruction -- but the only one that catches a"
              " permutation applied in the wrong order.",
-    )
-    parser.add_argument(
-        "--packs", action="store_true",
-        help="Additionally re-hash each pack file against its own trailer."
-             " Off by default: at the deep tier every referenced byte is"
-             " already checked against a stronger, ref-anchored hash, so this"
-             " only adds coverage of framing and unreferenced regions.",
     )
     parser.add_argument(
         "--all", action="store_true",
@@ -106,7 +98,6 @@ def run(args: argparse.Namespace) -> dict:
         repo, roots,
         tier=_tier(args),
         check_content_hash=args.content,
-        verify_packs=args.packs,
     )
 
     result = report.as_dict()
@@ -180,11 +171,9 @@ def format_human(result: dict) -> str:
         f"{output.human_bytes(result['bytes_verified'])} verified in "
         f"{result['elapsed']:.2f}s ({output.human_bytes(rate)}/s)"
     )
-    if tier != verify_engine.CONTENT:
+    if tier == verify_engine.STRUCTURE:
         lines.append(
-            f"NOTE: the {tier!r} tier detects corruption, not tampering -- "
-            f"its reference hashes live in files an attacker also controls. "
-            f"Run without --{'shallow' if tier == 'structure' else 'fast'} "
-            f"for the ref-anchored check."
+            "NOTE: --shallow checks that chunks exist, not what is in them. "
+            "Run without it to check the bytes."
         )
     return "\n".join(lines)

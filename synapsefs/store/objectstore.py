@@ -43,14 +43,22 @@ class ObjectStore:
         # atomic.gc_tmp_dir's docstring for the full argument.
         gc_tmp_dir(self.tmp_dir)
 
-    def _path_for(self, object_hash: str) -> Path:
-        """Sharded on-disk path for a hex hash.
+    def path_for(self, object_hash: str) -> Path:
+        """Sharded on-disk path for a hex hash: `objects/<ab>/<cd>/<60 hex>`.
 
-        The single source of truth for the sharding scheme -- both put()
-        and get() call this, so the on-disk layout can only ever drift from
-        FileFormat.md ~3 in one place.
+        **Two shard levels, and the same scheme for every object kind** --
+        commits, manifests, headers, configs and chunk payloads all live here
+        (ARCHITECTURE.md 3.3). An earlier draft gave chunks two levels and
+        everything else one, on the assumption that chunks vastly outnumber
+        objects; measured, they do not (1,002 objects against 810 chunks over
+        25 commits), and the split bought nothing but an "is this a chunk?"
+        ambiguity at every call site.
+
+        The filename is the hash **minus** the shard prefix, matching the
+        loose-object convention in `docs/kris_docs.md`. The single source of
+        truth for the layout -- `put`, `get` and `has` all route through here.
         """
-        return self.objects_dir / object_hash[:2] / object_hash
+        return self.objects_dir / object_hash[:2] / object_hash[2:4] / object_hash[4:]
 
     def has(self, object_hash: str) -> bool:
         """Whether an object with this hash is already stored.
@@ -61,7 +69,7 @@ class ObjectStore:
         because `put()` calls it on every single object to get
         content-addressed dedup for free.
         """
-        return self._path_for(object_hash).exists()
+        return self.path_for(object_hash).exists()
 
     def put(self, data: bytes) -> str:
         """Store `data`, returning its BLAKE3 hex hash.
@@ -73,7 +81,26 @@ class ObjectStore:
         system is only ever written to disk once.
         """
         object_hash = blake3.blake3(data).hexdigest()
-        target = self._path_for(object_hash)
+        target = self.path_for(object_hash)
+        if target.exists():
+            return object_hash
+        atomic_write(target, data, tmp_dir=self.tmp_dir)
+        return object_hash
+
+    def put_at(self, object_hash: str, data: bytes) -> str:
+        """Store `data` under a hash the caller already computed.
+
+        For **chunk payloads**, whose identity is `blake3` of the *decompressed
+        stream* rather than of the bytes being written (FORMAT.md 2.1). Hashing
+        `data` here would compute the wrong name -- and would also undo the
+        property that a chunk's identity survives recompression at a different
+        level.
+
+        The caller owns the correctness of `object_hash`; `verify --deep` is
+        what re-establishes it, by decompressing and re-hashing against the
+        name the manifest gave.
+        """
+        target = self.path_for(object_hash)
         if target.exists():
             return object_hash
         atomic_write(target, data, tmp_dir=self.tmp_dir)
@@ -87,7 +114,7 @@ class ObjectStore:
         whether the miss came from this store, a pack index, or anywhere
         else objects get looked up later.
         """
-        path = self._path_for(object_hash)
+        path = self.path_for(object_hash)
         try:
             return path.read_bytes()
         except FileNotFoundError as exc:

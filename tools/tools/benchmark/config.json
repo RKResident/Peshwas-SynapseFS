@@ -1,0 +1,17 @@
+{
+  "architecture": "PlainCNN",
+  "widths": [
+    224,
+    224,
+    448,
+    448,
+    896,
+    896,
+    1344,
+    1344,
+    1792,
+    1792
+  ],
+  "num_classes": 100,
+  "kernel_size": 3
+}

@@ -136,6 +136,57 @@ def check_chain(layers: list[Layer]) -> None:
             )
 
 
+def infer_order(layers: list[Layer]) -> list[Layer] | None:
+    """Recover the layer chain from shapes when the names do not give it.
+
+    ORDERING IS THE TRAP (see the module docstring): safetensors sorts keys
+    alphabetically, so `head` precedes `stem` and no amount of natural-sorting
+    fixes it. `order=[...]` exists for that, but requiring the caller to supply
+    it means alignment silently does nothing on any model whose layer names do
+    not happen to sort topologically -- which is most of them.
+
+    So infer it. The only structural fact available is the one `check_chain`
+    already tests: a consumer's column count must be a whole multiple of its
+    producer's output size. That gives a "can follow" relation over the
+    backbone, and the chain is a path through it.
+
+        stem   27 cols (3*3*3), out 64     <- 27 is divisible by no layer's
+        conv  576 cols (64*3*3), out 64       output size, so nothing can
+        head   64 cols,          out 100      precede it: it is the head
+
+    Greedy from that unique start, breaking ties by natural name order.
+    Returns None when the shapes do not determine a chain, in which case the
+    caller keeps its existing behaviour and raises with the actionable message.
+    """
+    chain = backbone(layers)
+    if len(chain) < 2:
+        return None
+
+    def can_follow(consumer: Layer, producer: Layer) -> bool:
+        return (consumer is not producer
+                and producer.out_size > 0
+                and consumer.weight.cols % producer.out_size == 0)
+
+    starts = [l for l in chain if not any(can_follow(l, p) for p in chain)]
+    if len(starts) != 1:
+        return None                      # ambiguous or cyclic; do not guess
+
+    ordered = [starts[0]]
+    remaining = [l for l in chain if l is not starts[0]]
+    while remaining:
+        nxt = [l for l in remaining if can_follow(l, ordered[-1])]
+        if not nxt:
+            return None
+        pick = min(nxt, key=lambda l: natural_key(l.stem))
+        ordered.append(pick)
+        remaining.remove(pick)
+
+    # Norms do not advance the chain and are attached by width later, so they
+    # can sit anywhere; keep them in natural order after their host's position.
+    norms = [l for l in layers if l.kind is LayerKind.NORM]
+    return ordered + sorted(norms, key=lambda l: natural_key(l.stem))
+
+
 def host_of(norm: Layer, layers: list[Layer]) -> Layer:
     """The layer whose output axis this norm sits on. Width decides, not order."""
     at = layers.index(norm)
@@ -218,7 +269,17 @@ def parse(tensors: dict[str, TensorRef],
         if missing:
             raise TopologyError(f"order omits {missing}")
         layers.sort(key=lambda l: index[l.stem])
-    check_chain(layers)
+        check_chain(layers)
+    else:
+        try:
+            check_chain(layers)
+        except UnsupportedArchitecture:
+            # Alphabetical order is not the chain. Recover it from shapes.
+            inferred = infer_order(layers)
+            if inferred is None:
+                raise
+            layers = inferred
+            check_chain(layers)
     corroborate(config, layers)
 
     topo = build_groups(to_nodes(layers), tensors=dict(tensors),

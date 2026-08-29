@@ -37,9 +37,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import blake3
 import numpy as np
 
-from synapsefs.codec.chunk import DELTA, decode_chunk, dtype_spec
-from synapsefs.errors import IntegrityError
-from synapsefs.pack.packset import PackSet
+from synapsefs.codec.checkpoint import apply_col_perm
+from synapsefs.codec.chunk import decode_chunk, dtype_spec, is_delta
+from synapsefs.errors import IntegrityError, ObjectNotFoundError
 from synapsefs.safetensors_io import TensorSpec
 from synapsefs.store.objectstore import ObjectStore
 
@@ -272,21 +272,19 @@ def walk_first_parent(
     return out
 
 
-def checkpoint_sizes(store: ObjectStore, packs: PackSet, commit_hash: str) -> dict:
+def checkpoint_sizes(store: ObjectStore, commit_hash: str) -> dict:
     """`{"original_bytes", "stored_bytes", "tensors", "chunks"}` for one commit.
 
-    Neither number is recorded in the commit object, and deliberately so: a
-    commit is immutable and content-addressed, and both figures are *derived*
-    from objects it already points at. Baking them in would put a cached
-    summary inside a hash -- so a repack that changed nothing semantically
-    would fork the commit identity, and a stale figure could never be
-    corrected. Recomputing here costs one JSON read per tensor plus one index
-    lookup per chunk, both of which are already mmap'd.
+    Neither number is recorded in the commit object, deliberately: both are
+    *derived* from objects it already points at, and baking a cached summary
+    into an immutable content-addressed object would fork the commit identity
+    on a semantically-null repack.
 
-    `stored_bytes` counts each distinct chunk object **once**, even when
-    several tensors or several commits reference it. That is the honest
-    reading of "what this commit costs on disk": a deduped chunk was paid for
-    by whoever wrote it first.
+    `stored_bytes` counts each distinct chunk **once**, even when several
+    tensors or commits reference it -- the honest reading of "what this commit
+    costs on disk", since a deduped chunk was paid for by whoever wrote it
+    first. It comes from `stat()` now that chunks are loose files; there is no
+    index to consult.
     """
     commit = get_json(store, commit_hash)
     manifest = get_json(store, commit["checkpoint_manifest"])
@@ -307,9 +305,9 @@ def checkpoint_sizes(store: ObjectStore, packs: PackSet, commit_hash: str) -> di
             if object_hex in seen:
                 continue
             seen.add(object_hex)
-            located = packs.lookup(bytes.fromhex(object_hex))
-            if located is not None:
-                stored += located.entry.stored_len
+            path = store.path_for(object_hex)
+            if path.is_file():
+                stored += path.stat().st_size
 
     return {
         "original_bytes": original,
@@ -332,9 +330,8 @@ class CommitCheckpoint:
     Nothing larger than the requested span is ever decoded.
     """
 
-    def __init__(self, store: ObjectStore, packs: PackSet, commit_hash: str):
+    def __init__(self, store: ObjectStore, commit_hash: str):
         self.store = store
-        self.packs = packs
         self.commit_hash = commit_hash
 
         self.commit = get_json(store, commit_hash)
@@ -346,6 +343,12 @@ class CommitCheckpoint:
 
     def names(self) -> List[str]:
         return list(self._tensor_manifests)
+
+    def refs(self):
+        """`{name: TensorSpec}`. The alignment solver probes for this to learn
+        the base's shapes; `TensorSpec` carries `.shape`, which is all it
+        reads."""
+        return {name: self.spec(name) for name in self.names()}
 
     def tensor_manifest_hashes(self) -> Dict[str, str]:
         """tensor name -> its tensor-manifest hash in this commit.
@@ -382,6 +385,85 @@ class CommitCheckpoint:
         flat = self._rows_from_manifest(self._tensor_manifests[name], start, stop)
         return flat.reshape(stop - start, spec.row_elems)
 
+    def gather_rows(self, name: str, indices) -> np.ndarray:
+        """Rows at arbitrary `indices`, in the order given.
+
+        The read primitive a **row permutation** needs. `rows(start, stop)`
+        cannot serve it: under a permutation `p`, target rows `[lo, hi)` are
+        built from base rows `p[lo:hi]`, which is a scattered set, not a range.
+
+        Each chunk is decoded at most once and its rows scattered into place,
+        rather than decoding the whole tensor -- so a gather touching one
+        chunk costs one chunk. Worst case (indices spread over every chunk) it
+        degrades to a full tensor decode, which is inherent to permutation and
+        not something a chunk layout can avoid.
+        """
+        spec = self.spec(name)
+        idx = np.asarray(indices, dtype=np.intp)
+        if idx.size and (idx.min() < 0 or idx.max() >= spec.num_rows):
+            raise IntegrityError(
+                f"{name}: gather index out of bounds for {spec.num_rows} rows"
+            )
+        return self._gather_from_manifest(
+            self._tensor_manifests[name], idx, spec.row_elems
+        )
+
+    def as_float(self, name: str) -> np.ndarray:
+        """The whole tensor as an owned 2-D float32 array.
+
+        For the alignment solver, which scores whole layers against each other
+        and cannot work on raw bit patterns. bf16 is widened by shifting into
+        the high half of a float32 -- exactly the bits the truncation that
+        produced it discarded -- because numpy has no bf16 dtype.
+
+        This is the one method here that materialises a whole tensor. That is
+        the alignment engine's memory model, not this class's: it streams one
+        *layer pair* at a time (PS module 1a requires out-of-core alignment),
+        which bounds the cost to the largest single tensor rather than the
+        checkpoint.
+        """
+        spec = self.spec(name)
+        raw = self.rows(name, 0, spec.num_rows).reshape(-1)
+        if spec.dtype == "BF16":
+            wide = raw.astype(np.uint32)
+            np.left_shift(wide, 16, out=wide)
+            out = wide.view(np.float32)
+        elif spec.dtype == "F16":
+            out = raw.view(np.float16).astype(np.float32)
+        elif spec.dtype == "F32":
+            out = raw.view(np.float32)
+        else:
+            out = raw.astype(np.float32)
+        return np.ascontiguousarray(out).reshape(spec.num_rows, spec.row_elems)
+
+    def _gather_from_manifest(
+        self, manifest_hash: str, idx: np.ndarray, row_elems: int
+    ) -> np.ndarray:
+        manifest = self._load(manifest_hash)
+        dtype = manifest["dtype"]
+        width, _ = dtype_spec(dtype)
+        out = np.empty(
+            (len(idx), row_elems), dtype={2: np.uint16, 4: np.uint32, 8: np.uint64}[width]
+        )
+        remaining = len(idx)
+        for chunk in manifest["chunks"]:
+            lo = chunk["row_start"]
+            hi = chunk["row_end"] + 1
+            mask = (idx >= lo) & (idx < hi)
+            if not mask.any():
+                continue
+            block = self._rows_from_manifest(manifest_hash, lo, hi).reshape(
+                hi - lo, row_elems
+            )
+            out[mask] = block[idx[mask] - lo]
+            remaining -= int(mask.sum())
+        if remaining:
+            raise IntegrityError(
+                f"gather covered only {len(idx) - remaining} of {len(idx)} rows; "
+                f"the manifest's chunks do not tile the tensor"
+            )
+        return out
+
     @property
     def header_bytes(self) -> bytes:
         """The verbatim source header, for byte-exact reconstruction."""
@@ -403,6 +485,58 @@ class CommitCheckpoint:
             cached = get_json(self.store, object_hash)
             self._cache[object_hash] = cached
         return cached
+
+    def _permutation(self, object_hash: Optional[str]) -> "Optional[np.ndarray]":
+        """Read a stored permutation object: packed int32 LE, no header."""
+        if object_hash is None:
+            return None
+        blob = self.store.get(object_hash)
+        if len(blob) % 4:
+            raise IntegrityError(
+                f"permutation {object_hash[:16]}: {len(blob)} bytes is not a "
+                f"whole number of int32"
+            )
+        perm = np.frombuffer(blob, dtype="<i4")
+        # A non-bijection would silently drop or duplicate rows rather than
+        # fail, so it is checked on the way in.
+        if not np.array_equal(np.sort(perm), np.arange(perm.size)):
+            raise IntegrityError(
+                f"permutation {object_hash[:16]} is not a bijection"
+            )
+        return perm
+
+    def _aligned_base(
+        self, manifest: dict, base_hash: str, lo: int, hi: int
+    ) -> np.ndarray:
+        """The base rows this chunk was diffed against.
+
+        **Applies the same gather the encoder applied -- never the inverse.**
+        `base_row_permutation[i]` is the base index that target index `i` came
+        from, so target rows `[lo, hi)` need base rows `perm[lo:hi]`. Inverting
+        here produces a valid bijection of the right length that reconstructs
+        scrambled weights, and no structural check would notice; only the
+        tensor `content_hash` (verify --content) catches it.
+        """
+        row_perm = self._permutation(manifest.get("base_row_permutation"))
+        col_perm = self._permutation(manifest.get("base_col_permutation"))
+
+        if row_perm is None:
+            block = self._rows_from_manifest(base_hash, lo, hi)
+            row_elems = block.size // max(1, hi - lo)
+            block = block.reshape(hi - lo, row_elems)
+        else:
+            base_manifest = self._load(base_hash)
+            shape = tuple(base_manifest["shape"])
+            row_elems = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+            block = self._gather_from_manifest(
+                base_hash, row_perm[lo:hi].astype(np.intp), row_elems
+            )
+
+        if col_perm is not None:
+            block = apply_col_perm(
+                block, col_perm, manifest.get("col_block_size", 1)
+            )
+        return block
 
     def _rows_from_manifest(self, manifest_hash: str, start: int, stop: int) -> np.ndarray:
         """Decode rows `[start, stop)` of one tensor-manifest, recursing into
@@ -427,22 +561,22 @@ class CommitCheckpoint:
             if hi <= start or lo >= stop:
                 continue
 
-            payload = self.packs.read(bytes.fromhex(chunk["object"]))
-            if payload is None:
+            try:
+                payload = self.store.get(chunk["object"])
+            except ObjectNotFoundError:
                 raise IntegrityError(
-                    f"chunk {chunk['object'][:16]} referenced by a manifest is not "
-                    f"in any pack"
-                )
+                    f"chunk {chunk['object'][:16]} referenced by a manifest is "
+                    f"not in the object store"
+                ) from None
 
             base_rows = None
-            if chunk["encoding"] == DELTA:
+            if is_delta(chunk["encoding"]):
                 if base_hash is None:
                     raise IntegrityError(
                         f"chunk {chunk['object'][:16]} is a residual but its "
                         f"tensor-manifest has no base"
                     )
-                # Only this chunk's rows of the base, not the whole tensor.
-                base_rows = self._rows_from_manifest(base_hash, lo, hi)
+                base_rows = self._aligned_base(manifest, base_hash, lo, hi)
 
             pieces.append(decode_chunk(chunk["encoding"], payload, base_rows, dtype=dtype))
             if covered_start is None:

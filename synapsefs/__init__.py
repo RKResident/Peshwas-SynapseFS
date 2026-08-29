@@ -4,8 +4,7 @@ Package layout (see docs/TeamInstructions.md for ownership):
 
     synapsefs.align   Topology IR, permutation-group resolution, weight matching.
     synapsefs.codec   Residual encoding: monotone-int delta, zigzag, zstd.
-    synapsefs.pack    Packfile and pack-index read/write.
-    synapsefs.store   Content-addressed store, commit DAG, refs, verification.
+    synapsefs.store   Content-addressed object store, refs, atomic writes.
     synapsefs.fuse    Read-only virtual mount.
     synapsefs.cli     Command-line entry points.
 

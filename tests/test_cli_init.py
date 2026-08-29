@@ -22,7 +22,6 @@ def test_init_creates_expected_layout(tmp_path: Path, capsys):
     assert exit_code == 0
     synapse_dir = target / ".synapse"
     assert (synapse_dir / "objects" / "tmp").is_dir()
-    assert (synapse_dir / "objects" / "pack").is_dir()
     assert (synapse_dir / "refs" / "heads").is_dir()
     assert (synapse_dir / "HEAD").read_text() == "ref: refs/heads/main\n"
 

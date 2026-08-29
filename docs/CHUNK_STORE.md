@@ -1,7 +1,16 @@
 # Loose chunk store
 
-Status: **specification only.** Packs (`docs/FORMAT.md` §5–6) are what ships
-today. This describes replacing the *storage* role of packfiles with
+> **SUPERSEDED, 2026-08-28.** The decision was taken; the normative spec is now
+> `ARCHITECTURE.md` §3.3 (paths), §3.5 (chunk files), §3.6 (transfer packs) and
+> §4.5.2 (what it does to verification). Two things changed from what is
+> written below: the shard is **two levels**, not one (`objects/12/34/5678…`),
+> and the filename is the hash **minus the shard prefix** (60 hex), not the
+> full hash — matching the loose-object convention in `kris_docs.md`.
+>
+> This document is kept for §6, the trade-off analysis, which is unchanged and
+> is the reasoning behind the decision.
+
+Status: superseded. Describes replacing the *storage* role of packfiles with
 content-addressed loose files, keeping the pack format for its *transfer* role.
 
 ```
@@ -212,9 +221,12 @@ schema version.
 
 ### Against
 
-1. **Read path is ~1.8× slower and 3× the syscalls** (50.4 µs vs 28.0 µs per
-   chunk, warm). Measured against a held-open pack fd; cold, the gap widens,
-   and PS module 3 grades cold-cache read throughput and daemon CPU.
+1. **Read path is ~1.10× slower end-to-end on a cold full checkpoint read**
+   (316 ms vs 286 ms; fetch 102 vs 66 µs/chunk with 8 threads, zstd decode 233
+   ms and identical either way). Warm the gap is 9%. An earlier figure of 1.8×
+   in this document was wrong — it measured Python `open()` overhead rather
+   than the filesystem. See `ARCHITECTURE.md` §5.4 for the full table and the
+   two mitigations.
 2. **Content addressing destroys locality, and this exposes it.** 810 chunks
    land in 248 directories. Chunks read together — consecutive row ranges of
    one tensor — are scattered maximally, because a hash has no relationship to

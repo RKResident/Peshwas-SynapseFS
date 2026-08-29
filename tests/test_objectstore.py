@@ -37,8 +37,8 @@ def test_same_content_dedupes(tmp_path: Path):
     h1 = store.put(b"identical")
     h2 = store.put(b"identical")
     assert h1 == h2
-    shard_dir = tmp_path / "objects" / h1[:2]
-    assert [p.name for p in shard_dir.iterdir()] == [h1]
+    leaf = tmp_path / "objects" / h1[:2] / h1[2:4]
+    assert [p.name for p in leaf.iterdir()] == [h1[4:]]
 
 
 def test_get_missing_object_raises_typed_error(tmp_path: Path):
@@ -96,9 +96,22 @@ def test_hash_is_content_addressed_blake3(tmp_path: Path):
     assert h == blake3.blake3(b"synapsefs").hexdigest()
 
 
-def test_sharded_by_first_two_hex_chars(tmp_path: Path):
-    """Locks in the exact sharding scheme from FileFormat.md ~3."""
+def test_sharded_two_levels_with_the_prefix_stripped(tmp_path: Path):
+    """Locks in the layout: objects/<ab>/<cd>/<60 hex> (ARCHITECTURE.md 3.3).
+
+    One scheme for every object kind, chunks included, and the filename is the
+    hash *minus* the shard prefix -- not the full hash repeated."""
     store = ObjectStore(tmp_path / "objects")
     h = store.put(b"shard-me")
-    expected_path = tmp_path / "objects" / h[:2] / h
-    assert expected_path.is_file()
+    assert (tmp_path / "objects" / h[:2] / h[2:4] / h[4:]).is_file()
+    assert not (tmp_path / "objects" / h[:2] / h).exists()
+
+
+def test_put_at_stores_under_a_caller_supplied_hash(tmp_path: Path):
+    """Chunk payloads are named for their *decompressed* stream, so the store
+    cannot derive the name from the bytes it is given."""
+    store = ObjectStore(tmp_path / "objects")
+    name = "ab" * 32
+    store.put_at(name, b"compressed-payload")
+    assert store.get(name) == b"compressed-payload"
+    assert store.has(name)

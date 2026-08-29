@@ -20,11 +20,10 @@ from synapsefs import graph
 from synapsefs.cli.main import main
 from synapsefs.errors import IntegrityError
 from synapsefs.materialize import (
-    compare_sources,
-    header_layout,
-    materialize,
+compare_sources,
+header_layout,
+materialize,
 )
-from synapsefs.pack.packset import PackSet
 from synapsefs.safetensors_io import SafetensorsFile
 from synapsefs.store.repo import Repo
 
@@ -32,8 +31,8 @@ from tests.test_graph import commit_series, make_repo
 
 
 def open_commit(repo: Repo, commit_hash: str):
-    packs = PackSet(repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp")
-    return packs, graph.CommitCheckpoint(repo.store, packs, commit_hash)
+    """Chunks are loose objects now, so there is nothing to open or close."""
+    return graph.CommitCheckpoint(repo.store, commit_hash)
 
 
 # -- header_layout ---------------------------------------------------------
@@ -45,8 +44,8 @@ def test_header_layout_follows_data_offsets_not_key_order(tmp_path):
     gets wrong, and it is not hypothetical -- nothing in the safetensors spec
     ties the two orders together."""
     doc = {
-        "z": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
-        "a": {"dtype": "F16", "shape": [2], "data_offsets": [4, 8]},
+    "z": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
+    "a": {"dtype": "F16", "shape": [2], "data_offsets": [4, 8]},
     }
     blob = json.dumps(doc).encode()
     header = struct.pack("<Q", len(blob)) + blob
@@ -55,8 +54,8 @@ def test_header_layout_follows_data_offsets_not_key_order(tmp_path):
 
 def test_header_layout_ignores_metadata_key(tmp_path):
     doc = {
-        "__metadata__": {"format": "pt"},
-        "a": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
+    "__metadata__": {"format": "pt"},
+    "a": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
     }
     blob = json.dumps(doc).encode()
     header = struct.pack("<Q", len(blob)) + blob
@@ -67,8 +66,8 @@ def test_non_contiguous_data_section_is_refused(tmp_path):
     """A gap between tensors is data the codec never ingested. Emitting zeros
     there and calling the result identical would be the worst outcome."""
     doc = {
-        "a": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
-        "b": {"dtype": "F16", "shape": [2], "data_offsets": [8, 12]},
+    "a": {"dtype": "F16", "shape": [2], "data_offsets": [0, 4]},
+    "b": {"dtype": "F16", "shape": [2], "data_offsets": [8, 12]},
     }
     blob = json.dumps(doc).encode()
     header = struct.pack("<Q", len(blob)) + blob
@@ -97,12 +96,9 @@ def test_every_commit_materializes_byte_identically(tmp_path):
 
     assert len(commits) == len(paths)
     for commit_hash, source_path in zip(commits, paths):
-        packs, view = open_commit(repo, commit_hash)
-        try:
-            out = tmp_path / f"out_{commit_hash[:8]}.safetensors"
-            stats = materialize(view, view.header_bytes, out)
-        finally:
-            packs.close()
+        view = open_commit(repo, commit_hash)
+        out = tmp_path / f"out_{commit_hash[:8]}.safetensors"
+        stats = materialize(view, view.header_bytes, out)
         assert out.read_bytes() == source_path.read_bytes()
         assert stats["total_bytes"] == source_path.stat().st_size
 
@@ -114,12 +110,9 @@ def test_tiny_batch_size_still_reconstructs_exactly(tmp_path):
     paths = commit_series(tmp_path, repo_dir, 2)
     repo = Repo.find(repo_dir)
 
-    packs, view = open_commit(repo, repo.resolve_ref("HEAD"))
-    try:
-        out = tmp_path / "tiny.safetensors"
-        materialize(view, view.header_bytes, out, batch_bytes=1)
-    finally:
-        packs.close()
+    view = open_commit(repo, repo.resolve_ref("HEAD"))
+    out = tmp_path / "tiny.safetensors"
+    materialize(view, view.header_bytes, out, batch_bytes=1)
     assert out.read_bytes() == paths[-1].read_bytes()
 
 
@@ -130,18 +123,15 @@ def test_failed_materialize_leaves_no_partial_file(tmp_path):
     commit_series(tmp_path, repo_dir, 1)
     repo = Repo.find(repo_dir)
 
-    packs, view = open_commit(repo, repo.resolve_ref("HEAD"))
+    view = open_commit(repo, repo.resolve_ref("HEAD"))
     out = tmp_path / "broken.safetensors"
-    try:
-        class Exploding:
-            def names(self): return view.names()
-            def spec(self, name): return view.spec(name)
-            def rows(self, name, start, stop): raise RuntimeError("boom")
+    class Exploding:
+        def names(self): return view.names()
+        def spec(self, name): return view.spec(name)
+        def rows(self, name, start, stop): raise RuntimeError("boom")
 
-        with pytest.raises(RuntimeError, match="boom"):
-            materialize(Exploding(), view.header_bytes, out)
-    finally:
-        packs.close()
+    with pytest.raises(RuntimeError, match="boom"):
+        materialize(Exploding(), view.header_bytes, out)
     assert not out.exists()
 
 
@@ -153,12 +143,9 @@ def test_compare_reports_zero_difference_for_a_correct_reconstruction(tmp_path):
     paths = commit_series(tmp_path, repo_dir, 3)
     repo = Repo.find(repo_dir)
 
-    packs, view = open_commit(repo, repo.resolve_ref("HEAD"))
-    try:
-        with SafetensorsFile(paths[-1]) as reference:
-            results = compare_sources(view, reference)
-    finally:
-        packs.close()
+    view = open_commit(repo, repo.resolve_ref("HEAD"))
+    with SafetensorsFile(paths[-1]) as reference:
+        results = compare_sources(view, reference)
 
     assert results
     for item in results:
@@ -197,7 +184,7 @@ def test_compare_reports_missing_tensors_rather_than_skipping_them(tmp_path):
     with SafetensorsFile(left) as a, SafetensorsFile(right) as b:
         by_name = {r.name: r.status for r in compare_sources(a, b)}
     assert by_name == {
-        "shared": "identical",
-        "only_left": "missing_right",
-        "only_right": "missing_left",
+    "shared": "identical",
+    "only_left": "missing_right",
+    "only_right": "missing_left",
     }

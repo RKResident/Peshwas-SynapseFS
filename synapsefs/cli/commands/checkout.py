@@ -20,7 +20,6 @@ from synapsefs import graph
 from synapsefs.cli import output
 from synapsefs.errors import UsageError
 from synapsefs.materialize import materialize
-from synapsefs.pack.packset import PackSet
 from synapsefs.store.repo import Repo
 
 DEFAULT_CHECKPOINT_NAME = "model.safetensors"
@@ -76,11 +75,8 @@ def run(args: argparse.Namespace) -> dict:
             Path(args.out) if args.out is not None
             else repo.root / _working_tree_name(commit)
         )
-        with PackSet(
-            repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp"
-        ) as packs:
-            source = graph.CommitCheckpoint(store, packs, commit_hash)
-            written = materialize(source, source.header_bytes, out_path)
+        source = graph.CommitCheckpoint(store, commit_hash)
+        written = materialize(source, source.header_bytes, out_path)
 
     if is_branch:
         repo.set_head_branch(args.ref)

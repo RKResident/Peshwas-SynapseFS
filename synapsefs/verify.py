@@ -56,8 +56,6 @@ from synapsefs import graph
 from synapsefs.codec.chunk import plain_stream
 from synapsefs.errors import IntegrityError, ObjectNotFoundError
 from synapsefs.materialize import DEFAULT_BATCH_BYTES, iter_tensor_bytes
-from synapsefs.pack.pack import verify_pack
-from synapsefs.pack.packset import PackSet
 from synapsefs.store.objectstore import ObjectStore
 from synapsefs.store.repo import Repo
 
@@ -134,7 +132,6 @@ class VerifyReport:
     bytes_verified: int = 0
     """Stored (compressed) bytes actually read and checked. Zero at
     `structure`, where no payload is touched."""
-    packs: int = 0
     elapsed: float = 0.0
     truncated: bool = False
     failures: List[Failure] = field(default_factory=list)
@@ -155,7 +152,6 @@ class VerifyReport:
             "chunks": self.chunks,
             "chunks_distinct": self.chunks_distinct,
             "bytes_verified": self.bytes_verified,
-            "packs": self.packs,
             "elapsed": self.elapsed,
             "truncated": self.truncated,
             "failures": [f.as_dict() for f in self.failures],
@@ -170,14 +166,12 @@ class _Walker:
     def __init__(
         self,
         store: ObjectStore,
-        packs: PackSet,
         *,
         tier: str,
         check_content_hash: bool,
         max_failures: int,
     ):
         self.store = store
-        self.packs = packs
         self.tier = tier
         self.check_content_hash = check_content_hash
         self.max_failures = max_failures
@@ -364,50 +358,48 @@ class _Walker:
         if object_hex in self._bad:
             return
 
-        content_hash = bytes.fromhex(object_hex)
-        located = self.packs.lookup(content_hash)
-        if located is None:
+        object_hex_lower = object_hex.lower()
+        path = self.store.path_for(object_hex_lower)
+        if not path.is_file():
             self._bad.add(object_hex)
             self.fail(Failure(
                 kind="missing-chunk", object=object_hex, referenced_by=where,
-                detail="referenced by a manifest but present in no pack",
+                detail="referenced by a manifest but not in the object store",
             ))
             return
 
         if self.tier == STRUCTURE:
             # Existence is all this tier promises -- CLI.md 7 calls it "broken
-            # links", and an index probe is a binary search over an mmap'd
-            # array with no pack file opened.
+            # links", and this is one stat().
             self._ok_chunks.add(object_hex)
             return
 
-        pack_name = located.pack_path.name
-        try:
-            # verify_checksum=True is the CHECKSUM tier, done inside read():
-            # it compares the stored 8-byte prefix without decompressing.
-            payload = self.packs.read(content_hash, verify_checksum=True)
-        except IntegrityError as exc:
-            self._bad.add(object_hex)
-            self.fail(Failure(
-                kind="chunk-checksum", object=object_hex, pack=pack_name,
-                referenced_by=where, detail=str(exc),
-            ))
-            return
-
-        if payload is None:                       # pragma: no cover - lookup hit
-            self._bad.add(object_hex)
-            self.fail(Failure(
-                kind="missing-chunk", object=object_hex, pack=pack_name,
-                referenced_by=where,
-            ))
-            return
+        payload = path.read_bytes()
         self.report.bytes_verified += len(payload)
+
+        # CHECKSUM tier. The reference value comes from the *tensor-manifest*,
+        # which is hash-chained to the ref -- so unlike the old pack-index
+        # checksum this is anchored, and detects substitution rather than only
+        # rot. Full tamper detection without decompressing anything
+        # (ARCHITECTURE.md 4.5.2).
+        expected = chunk.get("stored_checksum")
+        if expected is not None:
+            actual = blake3.blake3(payload).digest()[:8].hex()
+            if actual != expected:
+                self._bad.add(object_hex)
+                self.fail(Failure(
+                    kind="chunk-checksum", object=object_hex,
+                    expected=expected, actual=actual, referenced_by=where,
+                    detail="stored bytes do not match the checksum the manifest "
+                           "records -- rot or substitution",
+                ))
+                return
 
         if self.tier != CONTENT:
             self._ok_chunks.add(object_hex)
             return
 
-        if not self._verify_content(chunk, payload, object_hex, pack_name, where):
+        if not self._verify_content(chunk, payload, object_hex, None, where):
             return
         self._ok_chunks.add(object_hex)
 
@@ -452,8 +444,7 @@ class _Walker:
 
 
 def _verify_tensor_content_hashes(
-    store: ObjectStore, packs: PackSet, commit_hashes: Sequence[str],
-    walker: _Walker,
+    store: ObjectStore, commit_hashes: Sequence[str], walker: _Walker,
 ) -> None:
     """Reconstruct every tensor and check it against the manifest's
     `content_hash` (FORMAT.md 7.2).
@@ -471,7 +462,7 @@ def _verify_tensor_content_hashes(
     """
     for commit_hash in commit_hashes:
         try:
-            view = graph.CommitCheckpoint(store, packs, commit_hash)
+            view = graph.CommitCheckpoint(store, commit_hash)
         except (IntegrityError, KeyError) as exc:   # pragma: no cover - caught above
             walker.fail(Failure(
                 kind="decode-error", object=commit_hash, detail=str(exc)))
@@ -521,7 +512,6 @@ def verify_lineage(
     *,
     tier: str = CONTENT,
     check_content_hash: bool = False,
-    verify_packs: bool = False,
     max_failures: int = DEFAULT_MAX_FAILURES,
 ) -> VerifyReport:
     """Verify every commit reachable from `roots`.
@@ -531,57 +521,27 @@ def verify_lineage(
     locally accepted ref" looks like in code -- this function takes the root
     of trust as an argument rather than deciding it.
 
-    `verify_packs` additionally re-hashes each pack file against its own
-    trailer. Off by default, and the reason is worth stating: at the `content`
-    tier every *referenced* byte has already been checked against a stronger,
-    ref-anchored hash, so a full second pass over the packs only adds coverage
-    of the framing and of regions nothing references. It is a rot check on
-    bytes that do not matter, at the cost of doubling the read volume.
+    There is no longer a `verify_packs` tier. Packs are gone, and with them the
+    self-certifying structures that made one necessary: a chunk is now a file
+    named for its own content, and the only reference values left live in the
+    tensor-manifest, which is hash-chained to the ref.
     """
     if tier not in TIERS:
         raise ValueError(f"unknown tier {tier!r}; expected one of {TIERS}")
 
     started = time.perf_counter()
-    pack_dir = repo.objects_dir / "pack"
-    tmp_dir = repo.objects_dir / "tmp"
 
-    # repair=False is load-bearing. PackSet's default is to rebuild a missing
-    # or unreadable index on open, which is exactly right for a normal command
-    # and exactly wrong here: verify would silently repair the artifact it was
-    # asked to inspect and then report OK. A verification tool must never
-    # mutate what it verifies.
-    with PackSet(pack_dir, tmp_dir=tmp_dir, repair=False) as packs:
-        walker = _Walker(
-            repo.store, packs,
-            tier=tier, check_content_hash=check_content_hash,
-            max_failures=max_failures,
-        )
-        walker.walk(list(roots))
+    walker = _Walker(
+        repo.store,
+        tier=tier, check_content_hash=check_content_hash,
+        max_failures=max_failures,
+    )
+    walker.walk(list(roots))
+    report = walker.report
+    report.chunks_distinct = len(walker._ok_chunks)
 
-        report = walker.report
-        report.packs = len(packs)
-        report.chunks_distinct = len(walker._ok_chunks)
-
-        if tier != STRUCTURE:
-            try:
-                packs.verify()
-            except IntegrityError as exc:
-                walker.fail(Failure(
-                    kind="index-trailer", object="", detail=str(exc)))
-
-        if verify_packs:
-            for pack_hash in packs.pack_hashes():
-                path = pack_dir / f"{pack_hash.hex()}.pack"
-                try:
-                    verify_pack(path)
-                except IntegrityError as exc:
-                    walker.fail(Failure(
-                        kind="pack-trailer", object=pack_hash.hex(),
-                        pack=path.name, detail=str(exc)))
-
-        if check_content_hash:
-            reachable = _reachable(repo.store, roots)
-            _verify_tensor_content_hashes(repo.store, packs, reachable, walker)
+    if check_content_hash:
+        _verify_tensor_content_hashes(repo.store, _reachable(repo.store, roots), walker)
 
     report.elapsed = time.perf_counter() - started
     return report

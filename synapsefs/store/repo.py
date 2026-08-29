@@ -77,7 +77,7 @@ class Repo:
     def init_at(cls, path: Union[str, Path], branch: str = "main") -> "Repo":
         """Create a new repository at `path` (CLI.md ~2).
 
-        Creates `objects/`, `objects/tmp/`, `objects/pack/`, `refs/heads/`,
+        Creates `objects/`, `objects/tmp/`, `refs/heads/`,
         and an attached HEAD pointing at `branch`. No branch ref file and no
         commit are created here -- `refs/heads/<branch>` only starts
         existing once the first commit lands, matching CLI.md's `branch`
@@ -116,7 +116,6 @@ class Repo:
 
         objects_dir = synapse_dir / "objects"
         tmp_dir = objects_dir / "tmp"
-        (objects_dir / "pack").mkdir(parents=True)
         tmp_dir.mkdir(parents=True, exist_ok=True)
         (synapse_dir / "refs" / "heads").mkdir(parents=True)
 
@@ -186,13 +185,19 @@ class Repo:
         """
         lowered = ref.lower()
         if len(lowered) == _FULL_HASH_LEN:
-            if not (self.objects_dir / lowered[:2] / lowered).is_file():
+            if not (self.objects_dir / lowered[:2] / lowered[2:4]
+                    / lowered[4:]).is_file():
                 raise UsageError(f"unknown ref: {ref!r} (no such object)")
             return lowered
 
-        shard = self.objects_dir / lowered[:2]
+        # Two shard levels (objects/<ab>/<cd>/<60 hex>). _MIN_ABBREV_HASH_LEN
+        # is 6, so both levels are always determined by the prefix and no
+        # directory scan wider than one leaf is ever needed.
+        shard = self.objects_dir / lowered[:2] / lowered[2:4]
+        rest = lowered[4:]
         matches = (
-            [p.name for p in shard.iterdir() if p.is_file() and p.name.startswith(lowered)]
+            [lowered[:4] + p.name for p in shard.iterdir()
+             if p.is_file() and p.name.startswith(rest)]
             if shard.is_dir()
             else []
         )

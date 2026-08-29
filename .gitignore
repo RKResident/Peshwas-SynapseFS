@@ -19,6 +19,7 @@ checkpoints/
 *.synapse/
 tools/checkpoints
 tools/data
+tools/benchmark
 
 # --- Benchmark output --------------------------------------------------------
 bench-results/
@@ -38,8 +39,11 @@ dist/
 .venv/
 venv/
 env/
+../MySynapse/syn2
 
 # --- Editors -----------------------------------------------------------------
 .idea/
 .vscode/
 *.swp
+tools/benchmark/
+tools/dtaa

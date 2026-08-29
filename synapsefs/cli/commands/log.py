@@ -14,7 +14,6 @@ from typing import Dict, List, Optional
 from synapsefs import graph
 from synapsefs.cli import output
 from synapsefs.errors import UsageError
-from synapsefs.pack.packset import PackSet
 from synapsefs.store.repo import Repo
 
 
@@ -80,20 +79,19 @@ def run(args: argparse.Namespace) -> dict:
     decorations = _decorations(repo, head_branch, head_commit)
 
     commits: List[dict] = []
-    with PackSet(repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp") as packs:
-        for commit_hash, commit in walk:
-            entry = {
-                "commit": commit_hash,
-                "parents": list(commit.get("parents") or []),
-                "message": commit.get("message", ""),
-                "timestamp": commit.get("timestamp", ""),
-                "full": bool(commit.get("full", False)),
-                "checkpoint_name": commit.get("checkpoint_name"),
-                "refs": decorations.get(commit_hash, []),
-            }
-            if not args.no_size:
-                entry.update(graph.checkpoint_sizes(store, packs, commit_hash))
-            commits.append(entry)
+    for commit_hash, commit in walk:
+        entry = {
+            "commit": commit_hash,
+            "parents": list(commit.get("parents") or []),
+            "message": commit.get("message", ""),
+            "timestamp": commit.get("timestamp", ""),
+            "full": bool(commit.get("full", False)),
+            "checkpoint_name": commit.get("checkpoint_name"),
+            "refs": decorations.get(commit_hash, []),
+        }
+        if not args.no_size:
+            entry.update(graph.checkpoint_sizes(store, commit_hash))
+        commits.append(entry)
 
     return {
         "ref": args.ref,

@@ -41,7 +41,9 @@ from synapsefs.codec.checkpoint import (
     ChunkRecord,
     encode_checkpoint,
 )
-from synapsefs.codec.chunk import DELTA, RAW, RAW_ZSTD, decode_chunk
+from synapsefs.codec.chunk import (
+    DELTA_SHUFFLE, RAW, RAW_SHUFFLE_ZSTD, decode_chunk, is_delta,
+)
 from synapsefs.safetensors_io import SafetensorsFile
 
 FIXTURE_ROOT = Path("fixtures")
@@ -57,7 +59,8 @@ MANIFEST_FIELDS = {
     "col_block_size",
     "chunks",
 }
-CHUNK_ENTRY_FIELDS = {"row_start", "row_end", "encoding", "object"}
+CHUNK_ENTRY_FIELDS = {"row_start", "row_end", "encoding", "object",
+                      "plain_len", "stored_checksum"}
 
 
 # --------------------------------------------------------------------------
@@ -129,7 +132,7 @@ def _reconstruct_all(
         for entry in manifest["chunks"]:
             payload = hash_to_payload[entry["object"]]
             base_rows = None
-            if entry["encoding"] == DELTA:
+            if is_delta(entry["encoding"]):
                 assert base is not None
                 base_rows = base.rows(name, entry["row_start"], entry["row_end"] + 1)
             parts.append(
@@ -393,7 +396,7 @@ def test_root_commit_all_chunks_raw_zstd_and_round_trips(tmp_path):
         target_path, None, emit=_collect(records), chunk_size_bytes=64
     )
     for c in result.manifests["w"]["chunks"]:
-        assert c["encoding"] == RAW_ZSTD
+        assert c["encoding"] == RAW_SHUFFLE_ZSTD
 
     with SafetensorsFile(target_path) as tgt:
         got = _reconstruct_all(tgt, None, result.manifests, records)
@@ -454,7 +457,7 @@ def test_tensor_changed_shape_between_base_and_target_does_not_raise(tmp_path):
 
     assert any("w" in note for note in result.notes)
     for c in result.manifests["w"]["chunks"]:
-        assert c["encoding"] in (RAW, RAW_ZSTD)
+        assert c["encoding"] in (RAW, RAW_SHUFFLE_ZSTD)
 
     with SafetensorsFile(target_path) as tgt:
         got = _reconstruct_all(tgt, None, result.manifests, records)

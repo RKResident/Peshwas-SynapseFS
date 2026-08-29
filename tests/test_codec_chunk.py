@@ -13,15 +13,22 @@ Run:
 
 from __future__ import annotations
 
+import blake3
 import numpy as np
 import pytest
 import zstandard as zstd
 
 from synapsefs.codec.chunk import (
     DELTA,
+    DEFAULT_LEVEL,
+    plain_stream,
+    unshuffle,
+    shuffle,
+    DELTA_SHUFFLE,
     FLOAT,
     RAW,
     RAW_ZSTD,
+    RAW_SHUFFLE_ZSTD,
     SINT,
     EncodedChunk,
     decode_chunk,
@@ -172,7 +179,7 @@ def test_roundtrip_with_a_base(dtype):
     base = _random(dtype, 512, seed=1)
     target = _random(dtype, 512, seed=2)
     chunk = encode_chunk(target, base, dtype=dtype)
-    assert chunk.encoding in (DELTA, RAW_ZSTD)
+    assert chunk.encoding in (DELTA_SHUFFLE, RAW_SHUFFLE_ZSTD)
     out = decode_chunk(chunk.encoding, chunk.payload, base, dtype=dtype)
     assert np.array_equal(out, target.reshape(-1))
 
@@ -182,7 +189,7 @@ def test_roundtrip_with_a_base(dtype):
 def test_roundtrip_without_a_base(dtype, compress_raw):
     target = _random(dtype, 512, seed=3)
     chunk = encode_chunk(target, None, dtype=dtype, compress_raw=compress_raw)
-    assert chunk.encoding == (RAW_ZSTD if compress_raw else RAW)
+    assert chunk.encoding == (RAW_SHUFFLE_ZSTD if compress_raw else RAW)
     out = decode_chunk(chunk.encoding, chunk.payload, dtype=dtype)
     assert np.array_equal(out, target.reshape(-1))
 
@@ -256,7 +263,7 @@ def test_nearly_identical_chunks_compress_far_better_than_raw():
 
     delta = encode_chunk(target, base, dtype="F16", allow_raw_fallback=False)
     raw = encode_chunk(target, None, dtype="F16")
-    assert delta.encoding == DELTA
+    assert delta.encoding == DELTA_SHUFFLE
     assert delta.stored_len * 10 < raw.stored_len
 
 
@@ -278,8 +285,8 @@ def test_raw_fallback_wins_when_the_delta_does_not_help():
     fell_back = encode_chunk(target, base, dtype="F16", allow_raw_fallback=True)
     forced = encode_chunk(target, base, dtype="F16", allow_raw_fallback=False)
 
-    assert forced.encoding == DELTA
-    assert fell_back.encoding == RAW_ZSTD
+    assert forced.encoding == DELTA_SHUFFLE
+    assert fell_back.encoding == RAW_SHUFFLE_ZSTD
     assert fell_back.stored_len < forced.stored_len
     # A fallen-back chunk must still decode -- and without needing the base.
     assert np.array_equal(
@@ -418,7 +425,7 @@ def test_raw_decode_is_a_zero_copy_view_of_the_payload():
 def test_encoded_chunk_is_immutable():
     chunk = encode_chunk(np.zeros(8, dtype=np.float16), None, dtype="F16")
     with pytest.raises(AttributeError):
-        chunk.encoding = DELTA  # type: ignore[misc]
+        chunk.encoding = DELTA_SHUFFLE  # type: ignore[misc]
 
 
 def test_a_shared_compressor_is_accepted():
@@ -427,3 +434,113 @@ def test_a_shared_compressor_is_accepted():
     chunk = encode_chunk(base + np.float16(1), base, dtype="F16", compressor=compressor)
     out = decode_chunk(chunk.encoding, chunk.payload, base, dtype="F16")
     assert np.array_equal(out.view(np.float16), base + np.float16(1))
+
+
+# --- byte shuffle -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("width", [2, 4, 8])
+def test_shuffle_round_trips_at_every_width(width):
+    rng = np.random.default_rng(0)
+    stream = rng.integers(0, 256, size=64 * width, dtype=np.uint8).tobytes()
+    assert unshuffle(shuffle(stream, width), width) == stream
+
+
+def test_shuffle_groups_bytes_by_position():
+    """The transform, stated concretely: byte 0 of every element first, then
+    byte 1. Asserted on a literal rather than via round-trip, so a transpose in
+    the wrong direction cannot pass."""
+    stream = bytes([0xA0, 0xB0, 0xA1, 0xB1, 0xA2, 0xB2])
+    assert shuffle(stream, 2) == bytes([0xA0, 0xA1, 0xA2, 0xB0, 0xB1, 0xB2])
+
+
+def test_shuffled_encodings_are_what_encode_chunk_produces():
+    base = np.arange(256, dtype=np.uint16)
+    target = base + 3
+    assert encode_chunk(target, base, dtype="F16").encoding == DELTA_SHUFFLE
+    assert encode_chunk(target, None, dtype="F16").encoding == RAW_SHUFFLE_ZSTD
+
+
+def test_shuffle_actually_shrinks_a_residual():
+    """The reason the transform exists. Isolated against the *same* stream
+    compressed without the shuffle, at the same level -- so this measures the
+    shuffle and nothing else."""
+    rng = np.random.default_rng(1)
+    base = rng.integers(0, 60000, size=8192, dtype=np.uint16)
+    target = (base + rng.integers(0, 8, size=8192, dtype=np.uint16)).astype(np.uint16)
+
+    shuffled = encode_chunk(target, base, dtype="F16")
+    delta = (to_monotone_key(target, FLOAT) - to_monotone_key(base, FLOAT)).astype(np.uint16)
+    unshuffled = len(zstd.ZstdCompressor(level=DEFAULT_LEVEL).compress(delta.tobytes()))
+    assert shuffled.stored_len < unshuffled
+
+
+def test_the_encoder_no_longer_zigzags():
+    """Zigzag and byte shuffle are substitutes, and shuffle is the better one.
+    Pinned as a test because the losing combination still decodes, so nothing
+    else would notice it creeping back in."""
+    base = np.arange(4096, dtype=np.uint16)
+    target = (base + 300).astype(np.uint16)
+    chunk = encode_chunk(target, base, dtype="F16")
+
+    delta = (to_monotone_key(target, FLOAT) - to_monotone_key(base, FLOAT)).astype(np.uint16)
+    assert plain_stream(chunk.encoding, chunk.payload) == shuffle(delta.tobytes(), 2)
+
+
+def test_the_hash_covers_the_shuffled_stream():
+    """`plain_stream` must return exactly what was hashed, or `verify --deep`
+    compares the wrong bytes and reports every chunk as substituted."""
+    base = np.arange(512, dtype=np.uint16)
+    chunk = encode_chunk(base + 5, base, dtype="F16")
+    assert blake3.blake3(plain_stream(chunk.encoding, chunk.payload)).digest() \
+        == chunk.content_hash
+
+
+@pytest.mark.parametrize("encoding", [RAW_ZSTD, DELTA])
+def test_unshuffled_encodings_still_decode(encoding):
+    """Chunks written before the shuffle landed must keep decoding. The two old
+    names are not aliases of the new ones -- they mean 'this stream was never
+    shuffled' -- so decode must not un-shuffle them."""
+    base = np.arange(256, dtype=np.uint16)
+    target = base + 7
+    compressor = zstd.ZstdCompressor(level=DEFAULT_LEVEL)
+
+    if encoding is RAW_ZSTD:
+        stream, expected = target.tobytes(), target
+    else:
+        delta = to_monotone_key(target, FLOAT) - to_monotone_key(base, FLOAT)
+        stream, expected = zigzag(delta.astype(np.uint16)).tobytes(), target
+
+    decoded = decode_chunk(
+        encoding, compressor.compress(stream),
+        None if encoding is RAW_ZSTD else base, dtype="F16",
+    )
+    assert np.array_equal(decoded, expected)
+
+
+def test_the_encoder_no_longer_uses_the_monotone_key():
+    """The residual is a plain modular subtraction of raw bit patterns.
+
+    Pinned because the monotone-key version still decodes (as
+    `delta-zigzag-zstd`) and round-trips identically, so nothing else in the
+    suite would notice it coming back."""
+    base = np.array([0x3C00, 0xBC00, 0x0001], dtype=np.uint16)   # 1.0, -1.0, tiny
+    target = np.array([0x3C05, 0xBC05, 0x0006], dtype=np.uint16)
+    chunk = encode_chunk(target, base, dtype="F16")
+
+    expected = shuffle((target - base).astype(np.uint16).tobytes(), 2)
+    assert plain_stream(chunk.encoding, chunk.payload) == expected
+    assert np.array_equal(decode_chunk(chunk.encoding, chunk.payload, base,
+                                       dtype="F16"), target)
+
+
+def test_negative_weights_round_trip_without_the_key():
+    """The key existed to keep negative floats ordered. Removing it must not
+    cost exactness -- modular subtraction is reversible regardless of how the
+    bits are laid out."""
+    rng = np.random.default_rng(7)
+    base = rng.integers(0, 65536, size=4096, dtype=np.uint16)
+    target = (base + rng.integers(0, 2000, size=4096, dtype=np.uint16)).astype(np.uint16)
+    chunk = encode_chunk(target, base, dtype="F16")
+    assert np.array_equal(
+        decode_chunk(chunk.encoding, chunk.payload, base, dtype="F16"), target)

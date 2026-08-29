@@ -17,8 +17,8 @@ import pytest
 from safetensors.numpy import save_file
 
 from synapsefs import graph
+from synapsefs.codec.chunk import is_delta
 from synapsefs.cli.main import main
-from synapsefs.pack.packset import PackSet
 from synapsefs.safetensors_io import SafetensorsFile
 from synapsefs.store.repo import Repo
 
@@ -44,7 +44,7 @@ def commit_series(tmp_path: Path, repo_dir: Path, n: int) -> list[Path]:
         path = tmp_path / f"epoch{i}.safetensors"
         save_file({"frozen": frozen, "head": head.copy(), "bias": bias}, str(path))
         assert main(["-C", str(repo_dir), "commit", str(path), "-m", f"epoch {i}",
-                     "--config", str(tmp_path / "config.json"), "-q"]) == 0
+                 "--config", str(tmp_path / "config.json"), "-q"]) == 0
         paths.append(path)
     return paths
 
@@ -62,12 +62,11 @@ def lineage(repo: Repo) -> list[dict]:
 
 def reconstruct(repo: Repo, commit_hash: str) -> dict:
     """Every tensor of a commit, as raw bit patterns."""
-    with PackSet(repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp") as packs:
-        view = graph.CommitCheckpoint(repo.store, packs, commit_hash)
-        return {
-            name: view.rows(name, 0, view.spec(name).num_rows).ravel().copy()
-            for name in view.names()
-        }
+    view = graph.CommitCheckpoint(repo.store, commit_hash)
+    return {
+    name: view.rows(name, 0, view.spec(name).num_rows).ravel().copy()
+    for name in view.names()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +97,7 @@ def test_every_commit_in_a_chain_reconstructs_exactly(tmp_path):
             assert sorted(rebuilt) == sorted(original.names())
             for name in original.names():
                 assert np.array_equal(rebuilt[name], original.whole(name).ravel()), (
-                    f"{commit['message']}: tensor {name} differs"
+                f"{commit['message']}: tensor {name} differs"
                 )
 
 
@@ -111,9 +110,8 @@ def test_headers_are_replayed_verbatim(tmp_path):
     repo = Repo.find(repo_dir)
 
     for commit, path in zip(lineage(repo), paths):
-        with PackSet(repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp") as packs:
-            view = graph.CommitCheckpoint(repo.store, packs, commit["_hash"])
-            stored = view.header_bytes
+        view = graph.CommitCheckpoint(repo.store, commit["_hash"])
+        stored = view.header_bytes
         raw = path.read_bytes()
         assert stored == raw[: len(stored)]
 
@@ -166,7 +164,7 @@ def test_commits_form_a_star_so_reconstruction_is_always_one_hop(tmp_path):
                 continue
             base = graph.get_json(repo.store, base_hash)
             assert base["base_tensor_manifest"] is None, (
-                f"{commit['message']}/{name} is a residual of a residual"
+            f"{commit['message']}/{name} is a residual of a residual"
             )
             checked += 1
     assert checked > 0, "no residual manifests were exercised"
@@ -185,7 +183,7 @@ def test_the_anchor_actually_used_is_reported(tmp_path):
         assert graph.nearest_full_ancestor(repo.store, commit["_hash"]) == root
 
 
-def test_a_full_commit_still_dedups_against_earlier_packs(tmp_path):
+def test_a_full_commit_still_dedups_against_earlier_chunks(tmp_path):
     """FORMAT.md 12A's cost argument: a re-basing commit rewrites manifests but
     only re-stores chunks that actually changed, because its chunks are still
     content-addressed and deduped against every existing pack."""
@@ -199,7 +197,7 @@ def test_a_full_commit_still_dedups_against_earlier_packs(tmp_path):
     frozen = graph.get_json(repo.store, manifest["tensors"]["frozen"])
     # Stored in full, and its chunk was already in an earlier pack.
     assert frozen["base_tensor_manifest"] is None
-    assert all(c["encoding"] != "delta-zigzag-zstd" for c in frozen["chunks"])
+    assert all(not is_delta(c["encoding"]) for c in frozen["chunks"])
 
 
 def test_partial_row_reads_match_the_whole_tensor(tmp_path):
@@ -209,11 +207,10 @@ def test_partial_row_reads_match_the_whole_tensor(tmp_path):
     paths = commit_series(tmp_path, repo_dir, 4)
     repo = Repo.find(repo_dir)
 
-    with PackSet(repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp") as packs:
-        view = graph.CommitCheckpoint(repo.store, packs, repo.resolve_ref("HEAD"))
-        whole = view.rows("head", 0, view.spec("head").num_rows)
-        for lo, hi in [(0, 1), (5, 9), (10, 48), (47, 48), (0, 48)]:
-            assert np.array_equal(view.rows("head", lo, hi), whole[lo:hi]), (lo, hi)
+    view = graph.CommitCheckpoint(repo.store, repo.resolve_ref("HEAD"))
+    whole = view.rows("head", 0, view.spec("head").num_rows)
+    for lo, hi in [(0, 1), (5, 9), (10, 48), (47, 48), (0, 48)]:
+        assert np.array_equal(view.rows("head", lo, hi), whole[lo:hi]), (lo, hi)
 
 
 def test_an_unchanged_tensor_reuses_the_base_manifest(tmp_path):
@@ -225,9 +222,9 @@ def test_an_unchanged_tensor_reuses_the_base_manifest(tmp_path):
     tensor accumulates one zero-delta hop per commit and reconstruction walks
     all of them for nothing.
 
-        e0: manifest=86b2a599  base=None
-        e1: manifest=86b2a599  base=None      <- reused, not rewritten
-        e2: manifest=86b2a599  base=None
+    e0: manifest=86b2a599  base=None
+    e1: manifest=86b2a599  base=None      <- reused, not rewritten
+    e2: manifest=86b2a599  base=None
     """
     repo_dir = make_repo(tmp_path)
     commit_series(tmp_path, repo_dir, 6)
@@ -260,7 +257,7 @@ def test_reuse_does_not_break_reconstruction(tmp_path):
             assert sorted(rebuilt) == sorted(original.names())
             for name in original.names():
                 assert np.array_equal(rebuilt[name], original.whole(name).ravel()), (
-                    f"{commit['message']}: {name}"
+                f"{commit['message']}: {name}"
                 )
 
 
@@ -273,8 +270,8 @@ def test_reuse_is_reported(tmp_path):
     repo_dir = make_repo(tmp_path)
     paths = commit_series(tmp_path, repo_dir, 1)   # HEAD is the root, i.e. the anchor
     args = argparse.Namespace(
-        repo=str(repo_dir), checkpoint=str(paths[-1]), message="again",
-        config=None, base="HEAD", no_align=False, chunk_size=None, strict=False,
+    repo=str(repo_dir), checkpoint=str(paths[-1]), message="again",
+    config=None, base="HEAD", no_align=False, chunk_size=None, strict=False,
     )
     result = commit_cmd.run(args)
     # Re-committing the anchor's own checkpoint: every tensor is unchanged.
@@ -297,8 +294,8 @@ def test_commit_objects_match_the_documented_schema(tmp_path):
 
     head = graph.get_json(repo.store, repo.resolve_ref("HEAD"))
     assert set(head) == {
-        "checkpoint_manifest", "parents", "timestamp", "message", "full",
-        "checkpoint_name",
+    "checkpoint_manifest", "parents", "timestamp", "message", "full",
+    "checkpoint_name",
     }
     assert len(head["parents"]) == 1
 
@@ -320,8 +317,8 @@ def test_config_is_reused_from_the_base_when_omitted(tmp_path):
     with SafetensorsFile(paths[0]) as f:
         pass
     save_file({"frozen": np.zeros((48, 32), np.float16),
-               "head": np.ones((48, 32), np.float16),
-               "bias": np.zeros(48, np.float16)}, str(second))
+           "head": np.ones((48, 32), np.float16),
+           "bias": np.zeros(48, np.float16)}, str(second))
     # No --config, and no config.json beside the checkpoint.
     assert main(["-C", str(repo_dir), "commit", str(second), "-m", "no config", "-q"]) == 0
 
