@@ -22,7 +22,6 @@ from pathlib import Path
 import blake3
 import zstandard as zstd
 
-from synapsefs.pack.pack import scan_pack
 
 
 def evict(paths):
@@ -41,15 +40,12 @@ def main() -> None:
     ap.add_argument("--reps", type=int, default=3)
     args = ap.parse_args()
 
-    pack_dir = args.repo / ".synapse" / "objects" / "pack"
-    packs = sorted(pack_dir.glob("*.pack"))
-    if not packs:
-        raise SystemExit(f"no packs under {pack_dir}")
-
-    payloads = []
-    for p in packs:
-        raw = p.read_bytes()
-        payloads += [raw[e.offset:e.offset + e.stored_len] for e in scan_pack(p)]
+    # Chunks are loose objects now; read them straight out of the store.
+    objects = args.repo / ".synapse" / "objects"
+    files = [p for p in objects.rglob("*") if p.is_file() and "tmp" not in p.parts]
+    if not files:
+        raise SystemExit(f"no objects under {objects}")
+    payloads = [p.read_bytes() for p in files]
     total = sum(len(b) for b in payloads)
     print(f"{len(payloads)} chunks, {total/1048576:.1f} MiB from {args.repo}\n")
 

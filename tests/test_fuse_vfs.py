@@ -18,7 +18,6 @@ from synapsefs.fuse.daemon import mount_fuse, unmount_fuse
 from synapsefs.fuse.fs import SynapseFSOperations
 from synapsefs.fuse.reconstruct import VirtualSafetensorsFile
 from synapsefs.graph import CommitCheckpoint
-from synapsefs.pack.packset import PackSet
 from synapsefs.store.repo import Repo
 
 
@@ -80,21 +79,20 @@ def test_virtual_safetensors_file_byte_exactness(populated_repo):
     orig_bytes = orig_file.read_bytes()
 
     cache = ChunkCache(max_bytes=1024 * 1024)
-    with PackSet(repo.objects_dir / "pack", tmp_dir=repo.objects_dir / "tmp") as packs:
-        checkpoint = CommitCheckpoint(repo.store, packs, commit_hash)
-        vfile = VirtualSafetensorsFile(checkpoint, cache=cache)
+    checkpoint = CommitCheckpoint(repo.store, commit_hash)
+    vfile = VirtualSafetensorsFile(checkpoint, cache=cache)
 
-        assert vfile.total_size == len(orig_bytes)
+    assert vfile.total_size == len(orig_bytes)
 
-        # 1. Full read
-        reconstructed_full = vfile.read(0, vfile.total_size)
-        assert reconstructed_full == orig_bytes
+    # 1. Full read
+    reconstructed_full = vfile.read(0, vfile.total_size)
+    assert reconstructed_full == orig_bytes
 
-        # 2. Slice reads: header and arbitrary offsets
-        assert vfile.read(0, 100) == orig_bytes[0:100]
-        assert vfile.read(100, 500) == orig_bytes[100:600]
-        assert vfile.read(vfile.total_size - 50, 100) == orig_bytes[vfile.total_size - 50 :]
-        assert vfile.read(vfile.total_size, 10) == b""
+    # 2. Slice reads: header and arbitrary offsets
+    assert vfile.read(0, 100) == orig_bytes[0:100]
+    assert vfile.read(100, 500) == orig_bytes[100:600]
+    assert vfile.read(vfile.total_size - 50, 100) == orig_bytes[vfile.total_size - 50 :]
+    assert vfile.read(vfile.total_size, 10) == b""
 
 
 def test_fuse_operations_read_only(populated_repo):

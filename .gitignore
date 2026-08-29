@@ -46,4 +46,4 @@ env/
 .vscode/
 *.swp
 tools/benchmark/
-tools/dtaa
+tools/data

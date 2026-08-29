@@ -19,7 +19,6 @@ import trio
 from synapsefs.fuse.cache import ChunkCache
 from synapsefs.fuse.reconstruct import VirtualSafetensorsFile
 from synapsefs.graph import CommitCheckpoint
-from synapsefs.pack.packset import PackSet
 from synapsefs.store.repo import Repo
 
 
@@ -59,10 +58,9 @@ class SynapseFSOperations(pyfuse3.Operations):
         self.repo = repo
         self.ref_filter = ref_filter
         self.cache = ChunkCache(cache_size_bytes)
-        self.pack_set = PackSet(
-            repo.objects_dir / "pack",
-            tmp_dir=repo.objects_dir / "tmp",
-        )
+        # Chunks are loose, content-addressed objects (ARCHITECTURE.md 3.3),
+        # so there is no pack set to open, hold open, or close -- the object
+        # store is reached through `repo.store` directly.
 
         self._next_inode = 3
         self._next_fh = 100
@@ -90,8 +88,8 @@ class SynapseFSOperations(pyfuse3.Operations):
         )
 
     def close(self) -> None:
-        """Release underlying pack files and resources."""
-        self.pack_set.close()
+        """Release cached state. Chunk files are opened per read, so there are
+        no long-lived handles to release."""
         self.cache.clear()
 
     # -- Internal resolution helpers ---------------------------------------
@@ -101,11 +99,7 @@ class SynapseFSOperations(pyfuse3.Operations):
         if commit_hash in self._vfile_cache:
             return self._vfile_cache[commit_hash]
 
-        checkpoint = CommitCheckpoint(
-            self.repo.store,
-            self.pack_set,
-            commit_hash,
-        )
+        checkpoint = CommitCheckpoint(self.repo.store, commit_hash)
         vfile = VirtualSafetensorsFile(checkpoint, cache=self.cache)
         self._vfile_cache[commit_hash] = vfile
         return vfile
