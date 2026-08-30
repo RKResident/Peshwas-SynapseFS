@@ -510,9 +510,9 @@ Terms `ARCHITECTURE.md` uses without defining.
 | module | grade | state |
 |---|---|---|
 | 1 · Alignment & compression | 25% | compression **done**; alignment **done and connected** |
-| 2 · Filesystem (FUSE) | 25% | **not started** |
+| 2 · Filesystem (FUSE) | 25% | code merged in from a teammate's branch; not yet run as a live mount |
 | 3 · Cryptographic integrity | 20% | **done** |
-| 4 · Networking & CLI | 15% | CLI done except `merge`; `push`/`pull`/`serve` live outside this tree and are not merged in yet |
+| 4 · Networking & CLI | 15% | CLI complete incl. `merge`; `push`/`pull`/`serve` live outside this tree and are not merged in yet |
 | 5 · Documentation | 15% | this, `ARCHITECTURE.md`, `FORMAT.md`, `CLI.md`; **no README yet** |
 
 Some real numbers from the current code, on a 25-epoch training run of a 3.2M

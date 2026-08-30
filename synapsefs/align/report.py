@@ -50,11 +50,21 @@ def short(ref: str | None, n: int = 6) -> str:
 
 def header_line(result, base_ref: str | None = None) -> str:
     plural = "" if result.groups == 1 else "s"
-    return (f"Aligning against {short(base_ref)} "
+    verb = "Diffing against" if getattr(result, "disabled", False) else "Aligning against"
+    return (f"{verb} {short(base_ref)} "
             f"({result.groups} permutation group{plural})")
 
 
 def status_lines(result) -> list[str]:
+    # Identity ASSUMED and identity FOUND are different facts and must not
+    # print the same sentence. Under --no-align nothing was solved, so
+    # "detected" would be a claim the run never made.
+    if getattr(result, "disabled", False):
+        return ["  alignment disabled (--no-align) \u2014 base used as-is"]
+    if getattr(result, "rejected_groups", None) and result.identity:
+        return [f"  {len(result.rejected_groups)} group(s) solved to a "
+                f"permutation that did not reduce the residual \u2014 "
+                f"kept at identity"]
     if not result.solved:
         return [f"  {len(result.unsolved_groups)} group(s) could NOT be solved "
                 f"— those tensors are stored unaligned"]

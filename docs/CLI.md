@@ -385,27 +385,73 @@ per chunk, and `ok` is already false after the first.
 ## 8. `merge`
 
 ```
-synapsefs merge <branch> [-m <message>] [--ff-only] [--no-ff]
+synapsefs merge <branch> [-m <message>] [--ff-only] [--no-ff] [--average]
 ```
 
-Reconciles two commit DAGs: fast-forward when the target is an ancestor, otherwise a
-three-way merge against the common ancestor, producing a commit with two parents.
+Three-way merge of two branches. **Implemented.**
+
+Tensors are classified by their tensor-manifest `content_hash` — not by
+manifest hash. Two branches can hold byte-identical weights whose manifests
+differ because they were diffed against different bases, and comparing
+manifests would report a conflict on a tensor nobody touched (FORMAT.md §2.1).
+
+| base vs ours vs theirs | resolution |
+|---|---|
+| ours == theirs | unchanged |
+| ours == base, theirs differs | take theirs |
+| theirs == base, ours differs | take ours |
+| **all three differ** | **conflict** |
+| present on one side only | take that side |
+
+A conflict stops the merge at **exit 6** unless `--average` is given.
+
+### 8.1 `--average`, and why it is opt-in
+
+`--average` resolves conflicting tensors by **averaging them after alignment**:
+the incoming side is permuted into the current branch's basis, then the two are
+averaged elementwise. Integer buffers (BatchNorm's `num_batches_tracked`) are
+not averaged — the mean of two counters is not a counter — and keep ours.
+
+It is behind a flag, and prints its caveats every time, because averaging is
+not a neutral operation on weights:
+
+- Two independently-initialised models occupy different basins of the loss
+  landscape. Their elementwise mean is near-chance **unless** one is permuted
+  into the other's basis first. That is the Git Re-Basin result and the reason
+  `align/` exists.
+- Even aligned, wide networks merge well and narrow ones retain a real loss
+  barrier. Empirical, not guaranteed.
+- **SynapseFS cannot tell you the merged model is any good.** It guarantees the
+  merge is deterministic, hash-verified and byte-reproducible. Whether the
+  result is a *useful* model needs evaluation on data, which a storage system
+  does not have.
 
 ```
-$ synapsefs merge experiment
-Fast-forward: main 4d8e2f -> 7a1c90
+$ synapsefs merge alt
+error: 12 tensor(s) changed on both sides and cannot be merged automatically: ...
+       re-run with --average to resolve them by averaging after alignment
 
-$ synapsefs merge experiment -m "merge lr sweep"
-Merge base: 9f2c1a
-[main 8b3d11] merge lr sweep  (parents: 4d8e2f, 7a1c90)
+$ synapsefs merge alt --average -m "merge alt into main"
+Merging into 'main' (base bb950e, theirs ec7f1d)
+  averaged        12 tensor(s)
+  aligned theirs into our basis: 4 groups, identity=False
+[main 4bde50] merge alt into main
 ```
 
-Exit **6** on conflict, listing conflicting tensor names on stderr.
+### 8.2 Mechanics
 
-`OPEN QUESTION` — conflict semantics when both branches modify the same tensor.
-Candidates: (a) always conflict, require `--ours`/`--theirs`; (b) auto-resolve when one
-side is unchanged from the merge base. **(b) is the useful default; (a) is the honest
-fallback.** Decide before Phase 2.
+`MergedCheckpoint` implements the same `names()` / `spec()` / `rows()` surface
+as `SafetensorsFile` and `CommitCheckpoint`, so `materialize` writes the result
+with no new writer and it is byte-exact by the same path everything else uses.
+
+A merge commit is **always stored full**: it matches neither parent, so neither
+is a useful base for it. It carries both parents, and `verify` walks both
+(PS 2f/2g).
+
+Fast-forward when the current tip is an ancestor of the incoming branch;
+`--no-ff` forces a merge commit; `--ff-only` refuses anything else with exit 2.
+"Already up to date" covers both `theirs == head` and *theirs is an ancestor of
+head* — the state after any previous merge.
 
 ---
 

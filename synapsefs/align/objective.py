@@ -11,6 +11,33 @@ Only the pair together pins the permutation down. Rows alone tie whenever two
 units have identical incoming weights; columns alone tie whenever two units are
 read identically downstream.
 
+SCALE. Each tensor's contribution is divided by ||W_target|| * ||W_base||
+before it is summed, and that is not cosmetic -- without it the objective is
+dominated by whichever member happens to hold the largest numbers.
+
+A 1-D member (a bias, a BatchNorm scale, a running statistic) contributes
+`outer(t, a)`, a RANK-1 matrix whose argmax is the same column for every row.
+It carries almost no correspondence information on its own. A 2-D member
+contributes a full-rank matrix that does. Measured on group `g.features.28` of
+the 92M benchmark between consecutive epochs, where identity is provably the
+right answer:
+
+    features.28.weight        (1792, 12096)   ||C|| 5.75e+02   argmax==i 100.0%
+    features.29.running_var   (1792, 1)       ||C|| 2.17e+06   argmax==i   0.1%
+
+`running_var` holds variances, so its rank-1 term outweighed the convolution
+kernel by 3783x and the solver optimised it instead: the assignment moved 668
+of 1792 units away from identity on a pair that had never been permuted. Every
+such permutation then had to be thrown away downstream by the residual gate,
+after the sweeps had already been paid for.
+
+Normalising per tensor makes the members comparable rather than making the
+big one win. The rank-1 terms are near-flat among units of similar magnitude,
+so the full-rank term breaks the ties -- which is exactly the arrangement that
+recovers identity on a fine-tune and the true permutation on a permuted pair.
+It is applied identically in `group_cost` and `objective_value`, so coordinate
+descent's monotonicity still holds.
+
 DIRECTION. C is target-major: C[i, j] scores target unit i against base unit j.
 scipy's assignment on that returns col_ind[i] = j, which is exactly
 FileFormat.md 4.2's p[i] -- "the base index that target index i was diffed
@@ -64,6 +91,7 @@ class MatrixPair:
     def __init__(self, base: object, target: object, cache: bool = False) -> None:
         self._base, self._target = base, target
         self._cache: dict[tuple[str, str], np.ndarray] | None = {} if cache else None
+        self._scales: dict[str, float] = {}
 
     def _fetch(self, side: str, src: object, name: str) -> np.ndarray:
         if self._cache is not None and (side, name) in self._cache:
@@ -82,6 +110,19 @@ class MatrixPair:
 
     def base(self, name: str) -> np.ndarray:
         return self._fetch("base", self._base, name)
+
+    def scale(self, name: str) -> float:
+        """1 / (||target|| * ||base||) for this tensor, computed once.
+
+        Frobenius norms are invariant under permutation, so this is a constant
+        of the tensor pair and safe to cache across sweeps.
+        """
+        cached = self._scales.get(name)
+        if cached is None:
+            tn = float(np.linalg.norm(self.target(name)))
+            bn = float(np.linalg.norm(self.base(name)))
+            cached = self._scales[name] = 1.0 / (tn * bn) if tn > 0 and bn > 0 else 1.0
+        return cached
 
     def target(self, name: str) -> np.ndarray:
         return self._fetch("target", self._target, name)
@@ -104,6 +145,16 @@ def _perm_for(perms: Perms | None, gid: GroupId | None) -> np.ndarray | None:
     if perms is None or gid is None:
         return None
     return perms.get(gid)
+
+
+def _scale(src: MatrixSource, name: str) -> float:
+    """Per-tensor weight. Sources without a `scale` method compute it inline."""
+    getter = getattr(src, "scale", None)
+    if getter is not None:
+        return getter(name)
+    tn = float(np.linalg.norm(as_matrix(src.target(name))))
+    bn = float(np.linalg.norm(as_matrix(src.base(name))))
+    return 1.0 / (tn * bn) if tn > 0 and bn > 0 else 1.0
 
 
 def _pair(src: MatrixSource, name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -148,7 +199,7 @@ def group_cost(topo: Topology, gid: GroupId, src: MatrixSource,
         if owner is not None:
             block = topo.col_block_size(owner.id, name) or 1
             a = apply_col_perm(a, _perm_for(perms, owner.id), block)
-        cost += t @ a.T
+        cost += (t @ a.T) * _scale(src, name)
 
     for c in g.col_members:
         t, a = _pair(src, c.name)
@@ -162,12 +213,12 @@ def group_cost(topo: Topology, gid: GroupId, src: MatrixSource,
         if owner is not None:
             a = apply_row_perm(a, _perm_for(perms, owner.id))
         if c.col_block_size == 1:
-            cost += t.T @ a
+            cost += (t.T @ a) * _scale(src, c.name)
         else:
             k = c.col_block_size
             tb = t.reshape(rows, n, k).transpose(1, 0, 2).reshape(n, rows * k)
             ab = a.reshape(rows, n, k).transpose(1, 0, 2).reshape(n, rows * k)
-            cost += tb @ ab.T
+            cost += (tb @ ab.T) * _scale(src, c.name)
 
     return cost
 
@@ -209,5 +260,5 @@ def objective_value(topo: Topology, src: MatrixSource,
         if col_owner is not None:
             block = topo.col_block_size(col_owner.id, name) or 1
             a = apply_col_perm(a, _perm_for(perms, col_owner.id), block)
-        total += float(np.einsum("ij,ij->", t, a))
+        total += float(np.einsum("ij,ij->", t, a)) * _scale(src, name)
     return total

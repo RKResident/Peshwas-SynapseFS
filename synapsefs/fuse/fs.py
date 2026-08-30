@@ -18,7 +18,7 @@ import trio
 
 from synapsefs.fuse.cache import ChunkCache
 from synapsefs.fuse.reconstruct import VirtualSafetensorsFile
-from synapsefs.graph import CommitCheckpoint
+from synapsefs.graph import CommitCheckpoint, ancestors
 from synapsefs.store.repo import Repo
 
 
@@ -65,8 +65,17 @@ class SynapseFSOperations(pyfuse3.Operations):
         self._next_inode = 3
         self._next_fh = 100
         self._inodes: Dict[int, InodeInfo] = {}
+        # (parent_inode, name) -> inode. Without it _alloc_inode scans every
+        # allocated inode on every lookup and readdir entry, which is quadratic
+        # in the number of commits a mount has touched.
+        self._by_name: Dict[Tuple[int, str], int] = {}
         self._fh_to_vfile: Dict[int, VirtualSafetensorsFile] = {}
         self._vfile_cache: Dict[str, VirtualSafetensorsFile] = {}
+        # `stat` needs a file size and nothing else. Building a whole
+        # VirtualSafetensorsFile to get one would parse the header and keep a
+        # segment table per commit, so `ls -l commits/` would do that for every
+        # commit in the listing. The size alone is cached instead.
+        self._size_cache: Dict[str, int] = {}
 
         self._mount_time_ns = int(time.time() * 1e9)
 
@@ -130,12 +139,24 @@ class SynapseFSOperations(pyfuse3.Operations):
         return sorted(branches)
 
     def _list_commits(self) -> List[str]:
+        """Every commit reachable from a branch tip, not just the tips.
+
+        `lookup` has always resolved any commit hash, so the history was
+        reachable by typing a path; it just was not listed, which made `ls`
+        disagree with what `cd` would accept. Walking all parents rather than
+        first-parent matters once merges exist: a merge's second parent is
+        genuine history and would otherwise be invisible.
+        """
         commits = set()
-        # Collect branch tips
         for b in self._list_branches():
-            c = self._get_branch_commit(b)
-            if c:
-                commits.add(c)
+            tip = self._get_branch_commit(b)
+            if not tip:
+                continue
+            commits.add(tip)
+            try:
+                commits.update(ancestors(self.repo.store, tip))
+            except Exception:
+                pass
         if self.ref_filter and len(self.ref_filter) >= 6:
             try:
                 resolved = self.repo.resolve_ref(self.ref_filter)
@@ -144,6 +165,21 @@ class SynapseFSOperations(pyfuse3.Operations):
             except Exception:
                 pass
         return sorted(commits)
+
+    def _commit_size(self, commit_hash: str) -> int:
+        """Byte size of a commit's virtual file, without building a vfile."""
+        size = self._size_cache.get(commit_hash)
+        if size is None:
+            vfile = self._vfile_cache.get(commit_hash)
+            if vfile is not None:
+                size = vfile.total_size
+            else:
+                try:
+                    size = CommitCheckpoint(self.repo.store, commit_hash).total_size
+                except Exception:
+                    size = 0
+            self._size_cache[commit_hash] = size
+        return size
 
     def _alloc_inode(
         self,
@@ -154,17 +190,16 @@ class SynapseFSOperations(pyfuse3.Operations):
         branch_name: Optional[str] = None,
         vfile: Optional[VirtualSafetensorsFile] = None,
     ) -> InodeInfo:
-        # Check if already registered
-        for info in self._inodes.values():
-            if info.parent_inode == parent_inode and info.name == name:
-                # Update attributes if needed
-                if commit_hash:
-                    info.commit_hash = commit_hash
-                if branch_name:
-                    info.branch_name = branch_name
-                if vfile:
-                    info.vfile = vfile
-                return info
+        existing = self._by_name.get((parent_inode, name))
+        if existing is not None:
+            info = self._inodes[existing]
+            if commit_hash:
+                info.commit_hash = commit_hash
+            if branch_name:
+                info.branch_name = branch_name
+            if vfile:
+                info.vfile = vfile
+            return info
 
         inode = self._next_inode
         self._next_inode += 1
@@ -178,7 +213,15 @@ class SynapseFSOperations(pyfuse3.Operations):
             vfile=vfile,
         )
         self._inodes[inode] = info
+        self._by_name[(parent_inode, name)] = inode
         return info
+
+    def _looked_up(self, inode: int) -> pyfuse3.EntryAttributes:
+        """Attributes for a reply that the kernel will count as a lookup."""
+        info = self._inodes.get(inode)
+        if info is not None:
+            info.lookup_count += 1
+        return self._get_entry_attrs(inode)
 
     def _get_entry_attrs(self, inode: int) -> pyfuse3.EntryAttributes:
         info = self._inodes.get(inode)
@@ -208,8 +251,7 @@ class SynapseFSOperations(pyfuse3.Operations):
             if info.vfile is not None:
                 entry.st_size = info.vfile.total_size
             elif info.commit_hash:
-                vfile = self._resolve_commit(info.commit_hash)
-                entry.st_size = vfile.total_size if vfile else 0
+                entry.st_size = self._commit_size(info.commit_hash)
             else:
                 entry.st_size = 0
 
@@ -232,7 +274,7 @@ class SynapseFSOperations(pyfuse3.Operations):
         # 1. Under Root (parent_inode == 1)
         if parent_inode == pyfuse3.ROOT_INODE:
             if name_str == "commits":
-                return self._get_entry_attrs(self._commits_inode)
+                return self._looked_up(self._commits_inode)
 
             # Check if it is a branch name
             if name_str in self._list_branches():
@@ -244,7 +286,7 @@ class SynapseFSOperations(pyfuse3.Operations):
                     branch_name=name_str,
                     commit_hash=commit_hash,
                 )
-                return self._get_entry_attrs(info.inode)
+                return self._looked_up(info.inode)
 
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -264,7 +306,7 @@ class SynapseFSOperations(pyfuse3.Operations):
                     is_dir=True,
                     commit_hash=commit_hash,
                 )
-                return self._get_entry_attrs(info.inode)
+                return self._looked_up(info.inode)
 
             raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -290,7 +332,7 @@ class SynapseFSOperations(pyfuse3.Operations):
                     commit_hash=commit_hash,
                     vfile=vfile,
                 )
-                return self._get_entry_attrs(info.inode)
+                return self._looked_up(info.inode)
 
         raise pyfuse3.FUSEError(errno.ENOENT)
 
@@ -301,6 +343,26 @@ class SynapseFSOperations(pyfuse3.Operations):
     ) -> pyfuse3.EntryAttributes:
         """Fetch attributes for inode."""
         return self._get_entry_attrs(inode)
+
+    async def forget(self, inode_list) -> None:
+        """Drop inodes the kernel is no longer referencing.
+
+        Every reply to `lookup` increments a lookup count that only `forget`
+        decrements. Not implementing it does not break correctness -- the
+        entries stay valid -- but nothing is ever released, so a mount that
+        walks many commits grows its inode table for the lifetime of the
+        process. The permanent entries (root and `commits/`) are never
+        dropped: the kernel can reference them again at any time without a
+        fresh lookup."""
+        permanent = {pyfuse3.ROOT_INODE, self._commits_inode}
+        for inode, nlookup in inode_list:
+            info = self._inodes.get(inode)
+            if info is None or inode in permanent:
+                continue
+            info.lookup_count -= nlookup
+            if info.lookup_count <= 0:
+                self._inodes.pop(inode, None)
+                self._by_name.pop((info.parent_inode, info.name), None)
 
     async def opendir(
         self,

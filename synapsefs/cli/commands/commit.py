@@ -34,6 +34,14 @@ from synapsefs.codec.checkpoint import encode_checkpoint
 from synapsefs.errors import NotAlignableError, UsageError
 from synapsefs.store.repo import Repo
 
+#: Fraction of tensors that must fail to align before the anchor is judged
+#: worthless and the commit is stored in full instead. Above this, the base is
+#: a different model rather than an earlier version of this one.
+#:
+#: Not fired under --no-align: that path skips the residual pass, so
+#: `not_alignable` only ever contains missing or shape-mismatched tensors.
+UNUSABLE_ANCHOR_FRACTION = 0.5
+
 
 def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
     """Register this command's arguments on the shared subparsers object.
@@ -174,6 +182,28 @@ def run(args: argparse.Namespace) -> dict:
         store, checkpoint, base_source, config_path,
         no_align=args.no_align, notes=notes,
     )
+    # FORMAT.md 12A's dynamic re-base, now that we can actually detect the
+    # trigger. `nearest_full_ancestor` walks first parents for a FULL commit,
+    # which across a branch boundary can land on a *different model*: branch
+    # off, commit an unrelated checkpoint, and its successors keep diffing
+    # against the shared root because none of them is full yet. Measured, the
+    # 2nd and 3rd commit of such a branch each stored at ~94% -- essentially
+    # raw -- where diffing against their real predecessor gives ~60%.
+    #
+    # The alignment pass already knows: if most tensors came back
+    # not-alignable, the anchor has nothing useful to offer. Store this
+    # commit in full instead and let it become the branch's own hub, so
+    # everything after it has a base worth diffing against. One extra full
+    # commit, paid once per genuine divergence.
+    if not store_full and align_result is not None and align_result.tensors:
+        unusable = len(align_result.not_alignable) / len(align_result.tensors)
+        if unusable > UNUSABLE_ANCHOR_FRACTION:
+            notes.append(
+                f"anchor {anchor[:8]} unusable ({unusable*100:.0f}% of tensors "
+                f"not alignable against it); storing this commit in full"
+            )
+            store_full, base_source, alignment = True, None, None
+
     if args.strict and align_result is not None and align_result.not_alignable:
         raise NotAlignableError(
             f"{len(align_result.not_alignable)} tensor(s) not meaningfully "
@@ -293,26 +323,16 @@ def _align(store, checkpoint: Path, base_source, config_path: Path,
         notes.append(f"alignment skipped: {exc}")
         return None, None
 
+    # Whether a solved permutation is worth applying is decided in the solver,
+    # per group, because a permutation IS per group -- see
+    # `solver._reject_unhelpful`. By the time we get here every tensor still
+    # carrying a permutation belongs to a group that earned it, and every
+    # member of that group carries the same one. There is nothing left to
+    # second-guess tensor by tensor, and doing so is what broke the group
+    # invariant before.
     alignment = {}
-    skipped = 0
     for name, ta in result.tensors.items():
         if ta.identity:
-            continue
-        # Only apply a permutation that actually *reduced* the residual.
-        #
-        # The solver maximises the weight-matching objective, which is not the
-        # same thing as minimising the residual. Between two consecutive epochs
-        # of one training run the correct answer is identity, but early in
-        # training the weights move enough that some other matching can score
-        # higher on the objective while making the delta *larger*. Applying it
-        # then costs compression for nothing -- measured at 83.24% against
-        # 76.44% for identity on epoch 1 -> 2.
-        #
-        # `Assessment.helped` is exactly this test (post < pre), already
-        # computed by the residual pass, so the gate is free.
-        verdict = result.assessments.get(name)
-        if verdict is not None and not verdict.helped:
-            skipped += 1
             continue
         alignment[name] = TensorPermutation(
             row=ta.pi_row,
@@ -322,10 +342,10 @@ def _align(store, checkpoint: Path, base_source, config_path: Path,
             row_object=None if ta.pi_row is None else store.put(lap.pack(ta.pi_row)),
             col_object=None if ta.pi_col is None else store.put(lap.pack(ta.pi_col)),
         )
-    if skipped:
+    if result.rejected_groups:
         notes.append(
-            f"{skipped} tensor(s) kept at identity: the solved permutation did "
-            f"not reduce the residual"
+            f"{len(result.rejected_groups)} permutation group(s) kept at "
+            f"identity: the solved permutation did not reduce the residual"
         )
     return (alignment or None), result
 

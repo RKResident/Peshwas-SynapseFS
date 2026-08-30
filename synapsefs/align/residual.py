@@ -72,6 +72,10 @@ class Assessment:
     pre: float = float("nan")
     post: float = float("nan")
     alignable: bool = True
+    #: Element count. `pre` and `post` are relative and so not comparable
+    #: between tensors; `group_helped` weights by this to turn them into an
+    #: estimate of BYTES, which is what the decision is actually about.
+    numel: int = 0
 
     @property
     def improvement(self) -> float:
@@ -82,14 +86,85 @@ class Assessment:
         """Did the permutation do anything, as opposed to identity being right?"""
         return self.improvement > 1e-6
 
-
 def assess(target: np.ndarray, base: np.ndarray,
            aligned: np.ndarray | None = None,
            threshold: float = NOT_ALIGNABLE_THRESHOLD) -> Assessment:
     """pre is against the unpermuted base, post against the aligned one."""
     pre = relative_residual(target, base)
     post = pre if aligned is None else relative_residual(target, aligned)
-    return Assessment(pre, post, is_alignable(post, threshold))
+    return Assessment(pre, post, is_alignable(post, threshold),
+                      int(np.asarray(target).size))
+
+
+#: Clamp for the log-ratio when a residual is exactly zero. e**8 is a factor of
+#: ~3000 either way, far past any real permutation's effect, so it saturates
+#: the vote without letting a single perfectly-matched tensor become infinite.
+_LOG_CLAMP = 8.0
+
+
+def group_bit_delta(assessments) -> float:
+    """Estimated change in stored bits if this permutation is applied.
+
+    Negative means the permutation is expected to shrink the commit.
+
+    The codec stores a residual, and the bits a residual costs scale as
+    `numel * log2(typical |delta|)` -- doubling every delta costs one more bit
+    for every element. So a tensor's contribution is its element count times
+    the log of how much its residual changed, and the group's verdict is the
+    sum. Nothing else in this file weights tensors against each other, and
+    getting that weight wrong is the whole difficulty:
+
+      by COUNT, every tensor votes equally, so ten BatchNorm buffers outvote
+      the kernel they belong to;
+
+      by NORM (||target||), magnitude decides, and `running_var` holds
+      variances -- 1792 of them summed to 199 while a 21.7-million-element
+      convolution kernel summed to 11.8, so six statistics buffers outvoted
+      50 MiB of weights whose residual had TRIPLED;
+
+      by ELEMENT COUNT, the tensors that actually occupy the commit decide,
+      which is the question being asked.
+
+    Measured on epoch 1 -> 2 of the 92M benchmark, the norm-weighted version
+    accepted a permutation that grew the commit from 145.8 MB to 153.2 MB.
+    """
+    total = 0.0
+    for a in assessments:
+        if not (np.isfinite(a.pre) and np.isfinite(a.post)) or a.numel <= 0:
+            continue
+        if a.pre <= 0.0 and a.post <= 0.0:
+            continue
+        if a.post <= 0.0:
+            ratio = -_LOG_CLAMP
+        elif a.pre <= 0.0:
+            ratio = _LOG_CLAMP
+        else:
+            ratio = float(np.clip(np.log(a.post / a.pre), -_LOG_CLAMP, _LOG_CLAMP))
+        total += a.numel * ratio
+    return total
+
+
+def group_helped(assessments, min_gain: float = 1e-6) -> bool:
+    """Is this permutation worth applying to every tensor in its group?
+
+    The decision a permutation group needs, and the reason it cannot be made
+    one tensor at a time. A group is ONE ordering shared by every tensor that
+    touches the axis -- a layer's weight and bias, its norm's parameters and
+    BatchNorm buffers, and the next layer's input columns. Accepting it for
+    some members and rejecting it for others does not produce a partially
+    aligned checkpoint; it produces an incoherent one, because the stored
+    permutation no longer describes a correspondence between the two models'
+    units. Reconstruction still works -- each tensor gathers with whatever it
+    stored -- so nothing catches this except looking.
+
+    A group with nothing finite to judge is rejected: an unmeasured
+    permutation is not an improvement anyone can defend.
+    """
+    usable = [a for a in assessments
+              if np.isfinite(a.pre) and np.isfinite(a.post) and a.numel > 0]
+    if not usable:
+        return False
+    return group_bit_delta(usable) < -min_gain
 
 
 @dataclass

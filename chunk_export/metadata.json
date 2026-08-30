@@ -20,5 +20,19 @@
   "plain_len": 331776,
   "stored_checksum": "3cee9bb06dbfdc26",
   "base_tensor_manifest": "f88084d111dac8f63c5607c52d6b1808b16ad2db465bdc542bc51a29fdabd4ff",
-  "note": "3_deltas.bin holds uint16 little-endian modular differences: target_bits - base_bits mod 2^16. Add them back to the base's bit patterns to reconstruct. They are NOT weights."
+  "note": "3_deltas.bin and 4_xor_deltas.bin hold uint16 little-endian DIFFERENCES, not weights. Reconstruct with base+delta or base^delta respectively.",
+  "files": {
+    "1_stored.zst": "the chunk exactly as stored in the object store",
+    "2_uncompressed.bin": "zstd-decompressed; still byte-shuffled. Hashes to chunk_hash.",
+    "3_deltas.bin": "un-shuffled: target_bits - base_bits mod 2^16 (what the codec uses)",
+    "4_xor_deltas.bin": "un-shuffled: target_bits XOR base_bits (the alternative)"
+  },
+  "subtract_vs_xor": {
+    "raw_bytes": 331776,
+    "subtract_zstd": 268573,
+    "subtract_shuffle_zstd": 250289,
+    "xor_zstd": 275099,
+    "xor_shuffle_zstd": 257092,
+    "note": "XOR is also an exact bijection (target = base XOR delta) and has no borrow propagation, so unchanged exponent bits stay zero. It still loses: subtraction puts the drift SIGN in the high byte, giving two dominant values (0x00/0xff) in long runs, where XOR gives one value in shorter runs. See ARCHITECTURE.md 4.1."
+  }
 }

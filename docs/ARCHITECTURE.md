@@ -56,9 +56,9 @@ Everything else follows from defending that guarantee cheaply:
 | PS module | grade | state |
 |---|---|---|
 | 1 Alignment & compression | 25% | codec done; aligner **wired in** (§8) |
-| 2 Filesystem (FUSE) | 25% | **not started** |
+| 2 Filesystem (FUSE) | 25% | implementation merged in from the fuse-mount branch; **never run as a live mount since the storage change** |
 | 3 Cryptographic integrity | 20% | done (tiers to be re-based on §4.5.2) |
-| 4 Networking & CLI | 15% | CLI done except `merge`; `push`/`pull`/`serve` exist outside this tree, not merged in yet |
+| 4 Networking & CLI | 15% | CLI complete incl. `merge`; `push`/`pull`/`serve` exist outside this tree, not merged in yet |
 | 5 Documentation | 15% | this + `PRIMER.md` + `FORMAT.md` + `CLI.md`; **no README yet** |
 
 **Architecture scope.** Only BatchNorm, LayerNorm, convolution and dense layers
@@ -652,30 +652,43 @@ rows_per_chunk = max(1, chunk_size_bytes // (row_elems * width))     # 4 MiB def
 
 Chunks are always whole rows.
 
-**Chunk size is not a compression decision.** Measured across a 1000× range on
-a real epoch pair:
+**Chunk size IS a compression decision** — it was not before byte shuffle, and
+that change inverted the answer. Measured on the 92M-parameter benchmark model,
+epoch23 → epoch24, with the current codec:
 
 | chunk size | chunks | stored ratio |
 |---|---|---|
-| 16 KiB | 445 | 78.15% |
-| 64 KiB | 129 | 77.82% |
-| 1 MiB | 37 | 77.88% |
-| 4 MiB | 33 | 77.94% |
-| 16 MiB | 33 | 77.94% |
+| 64 KiB | 3,312 | 80.70% |
+| 256 KiB | 791 | 74.61% |
+| 1 MiB | 234 | 72.81% |
+| **4 MiB** *(default)* | **102** | **72.63%** |
+| 16 MiB | 70 | 72.61% |
+| 64 MiB | 63 | 72.60% |
 
-Flat. What chunk size actually trades is **dedup granularity and read latency
-against object count**:
+**8.1 points** between 64 KiB and 4 MiB. The sweep that used to sit here showed
+0.3pp of noise across the same range — it predated byte shuffle and is why this
+section previously claimed size did not matter.
 
-- a FUSE read of 128 KiB must decode its whole containing chunk. At ~600 MB/s
-  decompression that is **6.8 ms for a 4 MiB chunk versus 0.4 ms for 256 KiB**.
-  A chunk cache amortises this for sequential reads and does nothing for random
-  ones.
-- a tensor that changed in one place re-stores its whole chunk, so smaller
-  chunks dedup better on partially-frozen models.
-- smaller chunks mean proportionally more objects, inodes and directories.
+The reason is that shuffle builds its byte planes **per chunk**. A 64 KiB chunk
+yields a 32 KiB high-byte plane; a 4 MiB chunk yields a 2 MiB one. The
+sign-extension runs zstd feeds on average only ~1.2 elements, so it needs a long
+plane to accumulate enough matches to outweigh per-frame overhead — and at 3,312
+chunks that framing is itself non-trivial. Before shuffle there were no planes,
+so the size did not matter.
 
-Keep 4 MiB for sequential reads; drop to **256 KiB–1 MiB** if random-read
-latency through the mount matters.
+**The curve is flat above 4 MiB** (72.63% → 72.60% out to 64 MiB), so the
+default sits at the knee. Going larger buys ~0.03% and costs:
+
+- **read latency** — a 128 KiB FUSE read decodes its whole containing chunk:
+  ~3.4 ms at 4 MiB against ~54 ms at 64 MiB, at ~1.2 GB/s
+- **dedup granularity** — one changed weight re-stores the whole chunk
+- **peak RSS**, which scales with the in-flight chunk
+
+Encode time is flat across the entire range (1.8–2.4 s), so speed does not enter
+the decision.
+
+Keep 4 MiB. If mount latency ever forces a smaller chunk, **1 MiB costs 0.2pp**
+and is the affordable step; 256 KiB costs 2.0pp and is not.
 
 **How many chunks is that in practice?** A 6 MB CNN puts every tensor in one
 chunk, which is misleading. A 7B transformer at fp16 does not:
@@ -692,20 +705,46 @@ A handful of large tensors dominate both bytes and chunk count.
 
 ### 4.3 Star topology, not a chain
 
-Every residual commit diffs against its lineage's **nearest full ancestor**,
-not against its immediate parent. Every `REBASE_INTERVAL`-th commit (currently
+Commits form a **star**, not a chain. Every residual diffs directly against
+its group's nearest full ancestor; every `REBASE_INTERVAL`-th commit (currently
 4) is stored full and becomes a new hub.
 
 ```
-chain:  A <- B <- C <- D          reconstructing D = 3 decodes
-star:   A <- B                    reconstructing D = 1 decode
-        A <- C
-        A <- D
+chain:  A(full) <- B-A <- C-B <- D-C      reconstructing D = 3 decodes
+star:   A(full) <- B-A                    reconstructing D = 1 decode
+        A       <----- C-A
+        A       <---------- D-A
 ```
 
-`N` bounds **drift from the hub**, not walk depth. Measured at depth 3: the
-star costs +9% storage and reconstructs 2.19× faster, and the gap widens for
-partial reads, which under a chain pull chunks at every level.
+`N` bounds **drift from the hub**, not walk depth.
+
+**Measured on all 25 checkpoints of the 92M benchmark model**
+(`tools/experiments/topology_star_vs_chain.py`):
+
+| | raw | star | chain | chain saves |
+|---|---|---|---|---|
+| features.0.weight | 90.70% | 70.50% | 68.30% | 2.20pp |
+| features.31.weight | 84.45% | 79.18% | 77.44% | 1.73pp |
+| **all tensors** | **84.39%** | **79.27%** | **77.56%** | **1.71pp** |
+
+Reconstruction, worst commit in a group (`features.31.weight`, 55.1 MiB):
+
+| | decodes | time |
+|---|---|---|
+| star | 1 | **57.7 ms** |
+| chain | 3 | 165.3 ms (**2.87x**) |
+
+**The chain is 1.71pp smaller; the star reconstructs 2.87x faster.** Residual
+ratio is graded at 7% and mmap read throughput at 8%, so the trade favours the
+star -- and more so for the FUSE path specifically, where a 128 KiB partial
+read under a chain decodes three 4 MiB chunks instead of one.
+
+> **CORRECTION.** This section previously claimed the star costs "~9% more
+> storage" and reconstructs "2.19x faster". Both came from a 512x512 synthetic
+> tensor measured before byte shuffle, the zigzag removal and the zstd level
+> change. The real figures on real checkpoints are **1.71pp** and **2.87x** --
+> the star's cost was overstated 5x and its benefit understated. The conclusion
+> was right for the wrong numbers.
 
 Deciding at commit time:
 
@@ -715,8 +754,10 @@ since_full  = commits_since_full(head)
 store_full  = anchor is None or since_full >= REBASE_INTERVAL - 1
 ```
 
-A full commit is structurally identical to a root commit, so this needs no
-second code path.
+plus the dynamic trigger: if the alignment pass reports that most tensors are
+not alignable against the anchor, the anchor is a *different model* (a diverged
+branch), so this commit is stored full and becomes the branch's own hub. See
+`UNUSABLE_ANCHOR_FRACTION` in `cli/commands/commit.py`.
 
 ### 4.4 Reconstruction
 

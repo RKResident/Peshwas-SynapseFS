@@ -5,14 +5,17 @@ model whose tensors all fit in a single 4 MiB chunk, which hides every
 behaviour that only appears at scale: multi-chunk tensors, partial reads that
 touch a subset of chunks, gather cost under a row permutation, and object
 counts large enough for lookup structure to matter. Here the largest tensor is
-1792x1344x3x3 fp16 = 41 MiB, spanning 11 chunks.
+1792x1344x3x3 at two bytes per element = 41 MiB, spanning 11 chunks.
 
 This script only trains and saves. Committing is a separate step, so the two
 can be re-run independently:
 
-    python tools/train_benchmark.py
-    for f in tools/benchmark/epoch*.safetensors; do
-        synapsefs -C tools/benchmark commit "$f" -m "$(basename "$f" .safetensors)"
+    python tools/train_benchmark.py                     # bf16, the default
+    python tools/train_benchmark.py --dtype fp16 --out tools/benchmark
+
+    for f in tools/benchmark-bf16/epoch*.safetensors; do
+        synapsefs -C tools/benchmark-bf16 commit "$f" \
+            -m "$(basename "$f" .safetensors)"
     done
 
 Three choices exist for the storage side rather than the accuracy side:
@@ -30,9 +33,26 @@ for compression: Adam's normalised update moves every weight by roughly `lr`
 per step regardless of gradient magnitude, so consecutive checkpoints differ
 almost everywhere and there is little to deduplicate.
 
-**fp16 state dict.** What the PS evaluates. `num_batches_tracked` stays int64
-through `.half()`, so every checkpoint here is genuinely mixed-dtype -- which
-is the case a codec assuming one width per file gets wrong.
+**bf16 state dict.** Same width as fp16, different split: bf16 spends 8 bits
+on the exponent and 7 on the mantissa where fp16 spends 5 and 10. That matters
+to the codec rather than to the model, because the byte shuffle separates a
+value into a high plane (sign + exponent + the top mantissa bits) and a low
+plane (the rest), and bf16 moves three bits across that boundary. The high
+plane gains mantissa noise it did not carry before; the low plane loses some.
+Whether the 45.2%/100.0% plane split measured on fp16 survives the change is
+an open question this corpus exists to answer.
+
+`num_batches_tracked` is int64 and is left alone by the cast, so every
+checkpoint here is genuinely mixed-dtype -- the case a codec assuming one
+width per file gets wrong.
+
+**Autocast stays fp16 even when saving bf16.** The parameters themselves are
+fp32 throughout; autocast only chooses the precision of intermediate matmuls,
+and the saved file is a cast of the fp32 master weights. Leaving it at fp16
+keeps the optimisation trajectory bit-identical to the fp16 corpus, so the two
+sets of checkpoints hold the SAME weights at two precisions -- which is what
+makes a compression comparison between them mean anything. Switching autocast
+to bf16 would produce a different model and confound the measurement.
 """
 
 from __future__ import annotations
@@ -77,15 +97,22 @@ class PlainCNN(nn.Module):
         return self.head(self.features(x).flatten(1))
 
 
-def fp16_state_dict(model: nn.Module) -> dict:
-    """Cast floating-point tensors to fp16; leave integer buffers alone.
+#: `--dtype` name -> the torch dtype the checkpoint is stored in. Both are two
+#: bytes wide, so the checkpoint size is identical and only the bit layout
+#: differs.
+SAVE_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+def cast_state_dict(model: nn.Module, dtype: torch.dtype) -> dict:
+    """Cast floating-point tensors to `dtype`; leave integer buffers alone.
 
     `num_batches_tracked` is int64 and must stay that way -- casting it would
     silently corrupt BatchNorm on reload, and it is the reason the codec needs
-    an integer dtype at all.
+    an integer dtype at all. `is_floating_point()` is what protects it, and it
+    is as true for bfloat16 as it was for half.
     """
     return {
-        k: (v.half() if v.is_floating_point() else v).contiguous().cpu()
+        k: (v.to(dtype) if v.is_floating_point() else v).contiguous().cpu()
         for k, v in model.state_dict().items()
     }
 
@@ -100,13 +127,18 @@ def human(n: float) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", default="tools/benchmark",
-                    help="where epochNN.safetensors and config.json are written")
+    ap.add_argument("--out", default="tools/benchmark-bf16",
+                    help="where epochNN.safetensors and config.json are written. "
+                         "Defaults away from the fp16 corpus so a bf16 run cannot "
+                         "overwrite it -- the two are only useful side by side.")
     ap.add_argument("--data", default="data", help="dataset directory")
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--dtype", choices=sorted(SAVE_DTYPES), default="bf16",
+                    help="checkpoint storage dtype (default: bf16). Both are two "
+                         "bytes; only the exponent/mantissa split differs.")
     ap.add_argument("--smoke", action="store_true",
                     help="2 epochs on 2000 images with a 1/8-width model")
     args = ap.parse_args()
@@ -114,6 +146,7 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    save_dtype = SAVE_DTYPES[args.dtype]
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
 
@@ -151,7 +184,8 @@ def main() -> None:
     }, indent=2))
 
     print(f"model      PlainCNN {widths}")
-    print(f"parameters {n_params/1e6:.2f}M   fp16 checkpoint ~{human(n_params * 2)}")
+    print(f"parameters {n_params/1e6:.2f}M   {args.dtype} checkpoint "
+          f"~{human(n_params * 2)}")
     print(f"device     {torch.cuda.get_device_name(0) if dev == 'cuda' else 'cpu'}")
     print(f"data       CIFAR-100, {len(train)} train / {len(test)} test, batch {args.batch}")
     print(f"optimizer  Adam lr={args.lr}, no weight decay, no scheduler")
@@ -197,7 +231,7 @@ def main() -> None:
         train_s = time.time() - t0
         path = out / f"epoch{epoch:02d}.safetensors"
         t1 = time.time()
-        save_file(fp16_state_dict(model), str(path))
+        save_file(cast_state_dict(model, save_dtype), str(path))
         tqdm.write(
             f"epoch {epoch:>2}/{args.epochs}  loss {loss_sum/total:.3f}  "
             f"train {correct/total*100:5.2f}%  val {vc/vt*100:5.2f}%  "

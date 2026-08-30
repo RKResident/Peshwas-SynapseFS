@@ -47,3 +47,8 @@ env/
 *.swp
 tools/benchmark/
 tools/data
+chunk_export
+tools/tools/benchmark-mlp
+tools/tools/benchmark
+tools/tools/benchmark-bf16
+tools/tools/benchmark-mlp-seed1

@@ -699,30 +699,38 @@ things:
 
 ### Why the star wins
 
-Measured at depth 3 on a 512x512 fp16 tensor, across a synthetic fine-tune run:
+**Re-measured 2026-08-29 on all 25 checkpoints of the 92M benchmark model**
+(`tools/experiments/topology_star_vs_chain.py`). The table that stood here
+before was from a 512x512 *synthetic* tensor, measured before byte shuffle, the
+zigzag removal and the zstd level change, and it was wrong by 5x.
 
-| drift | star storage vs chain | reconstruct depth-3 |
+| | raw | star | chain | chain saves |
+|---|---|---|---|---|
+| features.0.weight (stem) | 90.70% | 70.50% | 68.30% | 2.20pp |
+| features.31.weight (deepest) | 84.45% | 79.18% | 77.44% | 1.73pp |
+| **all tensors** | **84.39%** | **79.27%** | **77.56%** | **1.71pp** |
+
+Reconstruction, worst commit in a group (`features.31.weight`, 55.1 MiB):
+
+| topology | decodes | time |
 |---|---|---|
-| frozen | 1.00x | chain 2.33 ms / star 1.06 ms (**2.19x**) |
-| tiny LR | 1.16x | |
-| typical fine-tune | 1.09x | |
-| aggressive | 1.05x | |
-| near-retrain | 1.03x | |
+| star | 1 | **57.7 ms** |
+| chain | 3 | 165.3 ms (**2.87x**) |
 
-Three things make that trade worth taking:
+> **Superseded figures.** This section previously claimed the star costs "~9%
+> more storage" and reconstructs "2.19x faster". The real numbers are **1.71pp**
+> and **2.87x** -- the star's cost was overstated 5x and its benefit
+> understated. The conclusion was right; the evidence was not.
 
-1. **The storage penalty shrinks exactly where it would hurt.** The star costs
-   most when drift is tiny (1.16x) -- but that is when residuals are small in
-   absolute terms, so it is 16% of a small number. Once residuals are large, the
-   delta is dominated by real change rather than by distance, and the two
-   converge to within 3-5%.
-2. **The graded weights point this way.** `residual_ratio` is 7%. Reconstruction
-   speed feeds `mmap read throughput` (8%), `POSIX compliance` (10%) and
-   `daemon peak RSS` (7%) -- and chain depth multiplies RSS too, since each
-   level holds a decoded array live while decoding the next.
-3. **Partial reads are the real workload.** The 2.19x above is whole-tensor
-   reconstruction. A 4 KB FUSE read of one row range under a chain pulls chunks
-   at *every* level; under a star it pulls two. The gap there is wider.
+Two things make the trade worth taking:
+
+1. **The graded weights point this way.** `residual_ratio` is 7%.
+   Reconstruction speed feeds `mmap read throughput` (8%), `POSIX compliance`
+   (10%) and `daemon peak RSS` (7%) -- and chain depth multiplies RSS too,
+   since each level holds a decoded array live while decoding the next.
+2. **Partial reads are the real workload.** The 2.87x above is whole-tensor
+   reconstruction. A 128 KiB FUSE read under a chain decodes a 4 MiB chunk at
+   *every* level; under a star it decodes two. The gap there is wider.
 
 ### Consequences to be aware of
 
