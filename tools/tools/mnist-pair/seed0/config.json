@@ -1,0 +1,9 @@
+{
+  "architecture": "MnistMLP",
+  "widths": [
+    512,
+    512
+  ],
+  "num_classes": 10,
+  "in_features": 784
+}
