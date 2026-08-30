@@ -26,6 +26,8 @@ from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import blake3
+import struct
+
 import numpy as np
 import zstandard as zstd
 
@@ -65,12 +67,22 @@ DELTA = "delta-zigzag-zstd"
 RAW_SHUFFLE_ZSTD = "raw-shuffle-zstd"
 DELTA_SHUFFLE = "delta-shuffle-zstd"
 
+#: Zigzag, then a byte per element: the value itself when it fits, or the
+#: marker 0xFF when it does not, with the oversized values moved to a second
+#: plane. See `_escape_stream` for the layout and `_ESCAPE_MAX_RATE` for when
+#: it is chosen.
+DELTA_ZIGZAG_ESCAPE = "delta-zigzag-escape-zstd"
+
 #: Encodings whose stream is byte-shuffled and must be un-shuffled after
 #: decompression. Consulted by `decode_chunk`, never by `plain_stream`.
+#: Encodings whose whole plain stream is one byte-shuffled block. The escape
+#: encoding is deliberately NOT here: only its second plane is shuffled, and
+#: that happens inside the stream rather than over it.
 _SHUFFLED = frozenset({RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE})
 
-_ZSTD_FRAMED = frozenset({RAW_ZSTD, DELTA, RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE})
-_DELTA_ENCODINGS = frozenset({DELTA, DELTA_SHUFFLE})
+_ZSTD_FRAMED = frozenset({RAW_ZSTD, DELTA, RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE,
+                          DELTA_ZIGZAG_ESCAPE})
+_DELTA_ENCODINGS = frozenset({DELTA, DELTA_SHUFFLE, DELTA_ZIGZAG_ESCAPE})
 
 
 def is_delta(encoding: str) -> bool:
@@ -372,6 +384,65 @@ def unshuffle(stream: bytes, width: int) -> bytes:
     return a.reshape(width, -1).T.copy().tobytes()
 
 
+#: The marker byte. 255 rather than 256 values in the narrow plane, because the
+#: marker has to be a value the plane can never legitimately hold.
+_ESCAPE = 255
+
+#: Above this fraction of escaping elements the encoding is not chosen. The
+#: threshold is arithmetic, not tuning: an element costs 1 byte when it fits
+#: and 3 when it does not, so the mean is `3 - 2p` for a fitting fraction `p`,
+#: which drops below the 2 bytes of a plain residual exactly at p = 0.5.
+#:
+#: Measured on the 92M benchmark, escape fraction against ratio, current codec
+#: in brackets: bf16 gap 1 13.4% -> 52.72% [60.88%]; gap 6 29.4% -> 60.40%
+#: [66.04%]; gap 12 46.1% -> 65.65% [67.69%]; gap 24 82.9% -> 75.23% [70.19%],
+#: and fp16 gap 1 64.7% -> 74.32% [72.56%]. The crossover sits between 46% and
+#: 65%, which is where the arithmetic says it should. Deciding by DTYPE instead
+#: would get bf16 at gap 24 wrong by 5pp.
+_ESCAPE_MAX_RATE = 0.5
+
+
+def _escape_stream(zz: np.ndarray) -> bytes:
+    """`[u64 LE narrow_len][narrow plane][shuffled wide plane]`.
+
+    One byte per element in the narrow plane -- the zigzag value itself, or
+    `_ESCAPE` -- and every escaped value, in order, as shuffled uint16 in the
+    wide plane. Keeping the wide values out of line is worth 2.6pp over
+    splicing them in after each marker: an oversized value interrupts a run of
+    small ones and zstd loses the match across the break. The two planes are
+    compressed as a single frame, which measured identically to two separate
+    frames and keeps `content_hash` covering one contiguous stream.
+    """
+    small = zz < _ESCAPE
+    narrow = np.where(small, zz, _ESCAPE).astype(np.uint8)
+    wide = shuffle(np.ascontiguousarray(zz[~small]).astype("<u2").tobytes(), 2)
+    return struct.pack("<Q", narrow.size) + narrow.tobytes() + wide
+
+
+def _unescape_stream(stream: bytes) -> np.ndarray:
+    """Exact inverse of `_escape_stream`, returning the zigzag values."""
+    if len(stream) < 8:
+        raise ValueError("escape stream is too short to hold its length prefix")
+    (narrow_len,) = struct.unpack("<Q", stream[:8])
+    end = 8 + narrow_len
+    if end > len(stream):
+        raise ValueError(
+            f"escape stream claims a {narrow_len}-byte narrow plane but holds "
+            f"{len(stream) - 8} bytes after the prefix"
+        )
+    narrow = np.frombuffer(stream, dtype=np.uint8, count=narrow_len, offset=8)
+    escaped = narrow == _ESCAPE
+    wide = np.frombuffer(unshuffle(stream[end:], 2), dtype="<u2")
+    if wide.size != int(escaped.sum()):
+        raise ValueError(
+            f"escape stream has {int(escaped.sum())} markers but "
+            f"{wide.size} wide values"
+        )
+    zz = narrow.astype(np.uint16)
+    zz[escaped] = wide
+    return zz
+
+
 def _finish(
     encoding: str,
     stream: bytes,
@@ -482,8 +553,30 @@ def encode_chunk(
     # replaces that with magnitude, which varies element to element and shatters
     # the runs -- measured mean run length 1.71 -> 1.59, costing 0.6-0.8pp.
     stream = shuffle(delta.astype(t_bits.dtype).tobytes(), width)
+    encoding = DELTA_SHUFFLE
+
+    # Zigzag + escape, when most residuals fit in one byte. The two conditions
+    # are independent and both required.
+    #
+    # Width 2 only: the wide plane is uint16, so a wider element has nothing to
+    # escape *into*. F16 and BF16 are the dtypes weights actually use.
+    #
+    # And only below `_ESCAPE_MAX_RATE`, because the encoding is a bet that
+    # exceptions are rare. On bf16 the median residual is 27 ULPs and 86.5% of
+    # zigzag values fit in a byte, so it wins by 8.16pp. On fp16 the median is
+    # 510, only 35.3% fit, and the same encoding needs 2.29 bytes per element
+    # -- more than storing the residual raw. The rate is what separates those,
+    # not the dtype: bf16 against a far-away base escapes 82.9% and belongs on
+    # the shuffle path too.
+    if width == 2:
+        zz = zigzag(delta.astype(t_bits.dtype))
+        if float((zz >= _ESCAPE).mean()) < _ESCAPE_MAX_RATE:
+            candidate = _escape_stream(zz)
+            if len(candidate) < len(stream):
+                stream, encoding = candidate, DELTA_ZIGZAG_ESCAPE
+
     encoded = _finish(
-        DELTA_SHUFFLE, stream, compressor.compress(stream), original_len,
+        encoding, stream, compressor.compress(stream), original_len,
         is_identical,
     )
 
@@ -532,7 +625,7 @@ def plain_stream(
     raise ValueError(
         f"unknown chunk encoding {encoding!r}; expected one of "
         f"{RAW!r}, {RAW_ZSTD!r}, {DELTA!r}, {RAW_SHUFFLE_ZSTD!r}, "
-        f"{DELTA_SHUFFLE!r}"
+        f"{DELTA_SHUFFLE!r}, {DELTA_ZIGZAG_ESCAPE!r}"
     )
 
 
@@ -573,6 +666,15 @@ def decode_chunk(
     if base is None:
         raise ValueError(f"{DELTA} chunk cannot be decoded without a base chunk")
     b_bits = _as_bits(base, width, "base")
+
+    if encoding == DELTA_ZIGZAG_ESCAPE:
+        residual = unzigzag(_unescape_stream(stream))
+        if residual.size != b_bits.size:
+            raise ValueError(
+                f"residual has {residual.size} elements but base chunk has "
+                f"{b_bits.size}"
+            )
+        return (b_bits + residual).astype(unsigned)
 
     residual = np.frombuffer(stream, dtype=unsigned)
     if residual.size != b_bits.size:

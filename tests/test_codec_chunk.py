@@ -34,6 +34,10 @@ from synapsefs.codec.chunk import (
     decode_chunk,
     dtype_spec,
     encode_chunk,
+    DELTA_ZIGZAG_ESCAPE,
+    _escape_stream,
+    _unescape_stream,
+    is_delta,
     from_monotone_key,
     to_monotone_key,
     unzigzag,
@@ -263,7 +267,10 @@ def test_nearly_identical_chunks_compress_far_better_than_raw():
 
     delta = encode_chunk(target, base, dtype="F16", allow_raw_fallback=False)
     raw = encode_chunk(target, None, dtype="F16")
-    assert delta.encoding == DELTA_SHUFFLE
+    # Which residual encoding wins depends on how many deltas fit in a byte,
+    # and this fixture barely moves 256 of 65536 elements, so it takes the
+    # escape path. The claim under test is the ratio, not the encoding name.
+    assert is_delta(delta.encoding)
     assert delta.stored_len * 10 < raw.stored_len
 
 
@@ -456,9 +463,45 @@ def test_shuffle_groups_bytes_by_position():
 
 def test_shuffled_encodings_are_what_encode_chunk_produces():
     base = np.arange(256, dtype=np.uint16)
-    target = base + 3
-    assert encode_chunk(target, base, dtype="F16").encoding == DELTA_SHUFFLE
-    assert encode_chunk(target, None, dtype="F16").encoding == RAW_SHUFFLE_ZSTD
+    assert encode_chunk(base, None, dtype="F16").encoding == RAW_SHUFFLE_ZSTD
+
+
+def test_residual_encoding_is_chosen_by_how_many_deltas_fit_in_a_byte():
+    """The selection rule, at both ends.
+
+    An element costs 1 byte under the escape encoding when it fits and 3 when
+    it does not, so it only pays while most of them fit. Choosing by dtype
+    instead would be wrong in both directions: bf16 against a distant base
+    escapes 82.9% of the time and belongs on the shuffle path, and any dtype
+    whose residuals are small belongs on the escape path.
+    """
+    rng = np.random.default_rng(4)
+    base = rng.integers(0, 65536, size=8192).astype(np.uint16)
+
+    tiny = (base + rng.integers(-8, 8, size=8192)).astype(np.uint16)
+    assert encode_chunk(tiny, base, dtype="BF16",
+                        allow_raw_fallback=False).encoding == DELTA_ZIGZAG_ESCAPE
+
+    wide = (base + rng.integers(-30000, 30000, size=8192)).astype(np.uint16)
+    assert encode_chunk(wide, base, dtype="BF16",
+                        allow_raw_fallback=False).encoding == DELTA_SHUFFLE
+
+
+def test_escape_stream_round_trips_the_entire_uint16_domain():
+    """Every value either fits the narrow plane or escapes to the wide one, and
+    the boundary at 0xFF is exactly where an off-by-one would hide."""
+    domain = np.arange(65536, dtype=np.uint16)
+    assert np.array_equal(_unescape_stream(_escape_stream(domain)), domain)
+
+
+@pytest.mark.parametrize("spread", [3, 200, 40000])
+def test_escape_encoding_round_trips_through_encode_decode(spread):
+    rng = np.random.default_rng(11)
+    base = rng.integers(0, 65536, size=4096).astype(np.uint16)
+    target = (base + rng.integers(-spread, spread + 1, size=4096)).astype(np.uint16)
+    enc = encode_chunk(target, base, dtype="BF16", allow_raw_fallback=False)
+    back = decode_chunk(enc.encoding, enc.payload, base, dtype="BF16")
+    assert np.array_equal(back, target)
 
 
 def test_shuffle_actually_shrinks_a_residual():

@@ -61,6 +61,11 @@ def main() -> None:
     ap.add_argument("--gaps", type=int, nargs="+", default=[1, 2, 3],
                     help="commit distances to measure (the star produces 1-3)")
     ap.add_argument("--level", type=int, default=DEFAULT_LEVEL)
+    ap.add_argument("--dtype", default="F16", choices=["F16", "BF16"],
+                    help="which corpus. Both are two bytes, but bf16 spends 8 "
+                         "bits on the exponent and 7 on the mantissa where fp16 "
+                         "spends 5 and 10, so the byte shuffle cuts in a "
+                         "different place and every scheme here can change rank.")
     args = ap.parse_args()
     c = zstd.ZstdCompressor(level=args.level)
 
@@ -68,8 +73,9 @@ def main() -> None:
            "* marks the winner in each row.  Lower is better.")
 
     for gap in args.gaps:
-        t, b, raw = load_pair(args.checkpoints, args.newest - gap, args.newest)
-        _, kind = dtype_spec("F16")
+        t, b, raw = load_pair(args.checkpoints, args.newest - gap, args.newest,
+                              dtype=args.dtype)
+        _, kind = dtype_spec(args.dtype)
         operators = [
             ("SUBTRACT", (t - b).astype(np.uint16)),
             ("XOR", (t ^ b).astype(np.uint16)),

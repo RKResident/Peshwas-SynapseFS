@@ -911,6 +911,73 @@ break-even is 1.0, where storing raw wins outright.
 sweep shuffling, the dirty-set optimisation. The naive "re-solve every group
 every sweep" is the same algorithm.
 
+#### 4.6.1 Per-tensor normalisation of the cost
+
+Each member's contribution is divided by `‖W_target‖ · ‖W_base‖` before it is
+summed. Without that division the objective is decided by whichever member
+holds the largest numbers, and on a BatchNorm group that is never the one
+carrying the information.
+
+A 1-D member — a bias, a norm scale, a running statistic — contributes
+`outer(t, a)`, a **rank-1** matrix whose argmax is the same column for every
+row. It says almost nothing about correspondence. A 2-D member contributes a
+full-rank matrix that does. Measured on `g.features.28` of the 92M benchmark
+between consecutive epochs, where identity is provably correct:
+
+| member | shape | ‖contribution‖ | `argmax == i` |
+|---|---|---|---|
+| `features.28.weight` | (1792, 12096) | 5.75e+02 | **100.0%** |
+| `features.29.running_var` | (1792, 1) | 2.17e+06 | 0.1% |
+
+`running_var` holds variances, so its rank-1 term outweighed the convolution
+kernel by 3783× and the solver optimised it instead: 668 of 1792 units moved
+away from identity on a pair that had never been permuted. Downstream, every
+one of those permutations had to be thrown away by the residual gate — after
+the sweeps had already been paid for.
+
+Normalising makes the members *comparable* rather than letting the biggest
+win. The rank-1 terms are near-flat among units of similar magnitude, so the
+full-rank term breaks the ties. Effects:
+
+| | before | after |
+|---|---|---|
+| commit epoch01→02, aligned | 4 m 59.7 s | **23.9 s** |
+| permuted-control recovery | 310.4 s (residual → 0.0000) | **19.2 s** (→ 0.0000) |
+| fine-tune alignment | 424.4 s, 3 sweeps | **5.7 s, 1 sweep** |
+
+The fine-tune fast path — "sweep 1 changed nothing, stop" — only began firing
+on real data once this was fixed.
+
+#### 4.6.2 GPU: worth it, but only after 4.6.1
+
+Alignment wall-clock is graded at 8%. The inner loop is a matmul, so a GPU is
+the obvious lever, and until 4.6.1 landed it was the wrong one: the assignment
+step took 71% of a solve and has no GPU path. Two things changed that. Sweeps
+dropped from 25 to 1, and each LAP got ~30× faster — Hungarian's runtime
+depends on how *decisive* the cost matrix is, and a near-degenerate one is its
+worst case. One full sweep over all groups of the 92M benchmark, measured:
+
+| | cost build | LAP | total |
+|---|---|---|---|
+| numpy + CPU LAP | 8.73 s | 0.60 s | 9.33 s |
+| torch/CUDA cost + CPU LAP | 1.84 s | 0.60 s | **2.43 s (3.84×)** |
+
+Three details decide whether it is 3.8× or a disappointing 1.5×:
+
+- **Ship fp16, widen on the device.** `as_matrix` widens to float32 on the CPU
+  (0.32 s for one 1792×12096 pair) and then sends twice the bytes. Uploading
+  the raw fp16 and calling `.float()` on device: 0.131 s → 0.074 s.
+- **Do not use tensor cores.** An fp16 matmul measured *slower* here
+  (0.280 s vs 0.074 s) and costs 4.5e-4 relative error. Widen to fp32.
+- **Leave LAP on the CPU.** It is 25% of the GPU version and scipy has no
+  device path. Auction or Sinkhorn would move it, but Sinkhorn returns a
+  doubly-stochastic matrix rather than a permutation, and rounding it can
+  break bijectivity that `is_permutation` then rejects.
+
+Peak VRAM was 447 MiB, so the PS's budget is not a constraint here. torch must
+stay an **optional** import with a numpy fallback — it costs ~474 MiB of RSS,
+and nothing in the read path may pay that.
+
 ---
 
 ## 5. Module guide
