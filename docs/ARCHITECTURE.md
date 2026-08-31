@@ -58,7 +58,7 @@ Everything else follows from defending that guarantee cheaply:
 
 | PS module | grade | state |
 |---|---|---|
-| 1 Alignment & compression | 25% | codec done; aligner **wired in** (§8) |
+| 1 Alignment & compression | 25% | codec done; aligner **wired in** (§8); scaling measured to n=10,000 at 100% recovery (§4.6.3) |
 | 2 Filesystem (FUSE) | 25% | run live: mounts, lists, and reads back byte-identical for full and residual commits at 206 MiB/s (§4.4.1). `forget()` and the inode index were also missing |
 | 3 Cryptographic integrity | 20% | done (tiers to be re-based on §4.5.2) |
 | 4 Networking & CLI | 15% | CLI complete incl. `merge`; `push`/`pull`/`serve` exist outside this tree, not merged in yet |
@@ -1249,6 +1249,97 @@ Three details decide whether it is 3.8× or a disappointing 1.5×:
 Peak VRAM was 447 MiB, so the PS's budget is not a constraint here. torch must
 stay an **optional** import with a numpy fallback — it costs ~474 MiB of RSS,
 and nothing in the read path may pay that.
+
+#### 4.6.3 How it scales with layer width
+
+Everything above was measured on the 92M CNN benchmark, whose widest group is
+**1792 units**. The PS evaluates to ~7B. The quantities that matter here scale
+with the *width* of a layer, not with parameter count — the cost matrix is
+`[n, n]` and the assignment solve is superlinear in `n` — so parameter count is
+the wrong axis to extrapolate along.
+
+**The two shapes land in completely different places.** A conv layer's
+parameters are `out × in × kh × kw`, so a 3×3 kernel multiplies by 9 and you
+reach 7B at roughly **4,000 channels**. A dense layer's are `h²` with no
+multiplier, so a depth-24 MLP needs roughly **17,800 hidden units**. Same
+parameter count, 4.5× the width. The risk was never "7B", it is "wide".
+
+Measured with `tools/experiments/align_scaling.py` on synthetic MLPs with a
+known ground-truth permutation, fp16, depth 3 (2 permutable groups), noise 0.01:
+
+| width | params | align | sweeps | peak RSS | recovery |
+|---|---|---|---|---|---|
+| 512 | 0.36M | 0.05 s | 2 | 87 MB | 100% |
+| 1,024 | 1.25M | 0.18 s | 2 | 117 MB | 100% |
+| 2,048 | 4.6M | 0.98 s | 2 | 243 MB | 100% |
+| 4,096 | 17.6M | 5.51 s | 2 | 658 MB | 100% |
+| 8,192 | 68.7M | 31.8 s | 2 | 2.29 GB | 100% |
+| **10,000** | **102M** | **50.8 s** | 2 | **3.36 GB** | **100%** |
+
+Fitted on n ≥ 2048: **time ~ n^2.50**, RSS ~ n^1.66.
+
+> **It is not n³.** Hungarian's runtime depends on how *decisive* the cost
+> matrix is — §4.6.2 already noted that a near-degenerate matrix is its worst
+> case. A cleanly recoverable permutation is its *best* case, and that is worth
+> 0.5 in the exponent. Do not quote n³ for this system; it is the textbook
+> bound, not the measured behaviour.
+
+**Noise robustness**, at width 2048. Noise is relative:
+`w += k · std(w) · N(0,1)`, so `k = 1.0` perturbs by as much as the weights
+themselves.
+
+| noise | recovery | residual after | sweeps | align |
+|---|---|---|---|---|
+| 0.0 – 0.3 | **100%** | 0.000 → 0.150 | 2 | ~1.0 s |
+| 0.5 | **100%** | 0.234 | 3 | 1.9 s |
+| 0.75 | 99.5% | 0.316 | 3 | 2.9 s |
+| 1.0 | 95.3% | 0.371 | 4 | 4.4 s |
+| 1.5 | 80.5% | 0.426 | 12 | 13.3 s |
+| 2.0 | 62.0% | 0.455 | 15 | 18.8 s |
+
+Perfect recovery holds until the perturbation reaches **half the weight
+standard deviation**, then degrades smoothly — no cliff, and `not_alignable`
+begins firing at 1.5, which is the residual gate correctly noticing it is in
+trouble rather than returning a confident wrong answer.
+
+**Width and noise multiply, they do not add.** This is the result to remember:
+
+| | noise 0.01 | noise 1.0 |
+|---|---|---|
+| width 8192 | 31.8 s | **215.5 s** |
+| sweeps | 2 | 5 |
+
+6.8× the wall clock for 2.5× the sweeps — so the *per-sweep* cost rose too, for
+the same reason the exponent is 2.5 rather than 3. A hard pair is expensive
+twice over: more sweeps, and a slower solve inside each one.
+
+The fine-tune fast path behaves as §4.6.1 claims — one sweep at every width,
+and about 3× cheaper (10.7 s against 31.8 s at width 8192).
+
+**What this means for a 7B fixture.** Extrapolating the fitted exponents from
+n = 10,000:
+
+```
+                    align      peak RSS
+n = 12,000          ~80 s        ~4.4 GB
+n = 16,384         ~174 s        ~7.5 GB
+n = 17,800         ~214 s        ~8.6 GB     <- the depth-24 7B MLP width
+```
+
+Those are for the *same* two-group model scaled in width only — they isolate
+the width term, they are not a whole-model estimate.
+
+Peak RSS is bounded by the *widest* layer, not the model, because groups are
+solved one at a time — so a deep model does not multiply memory. Wall clock
+does multiply by group count, so a depth-24 wide MLP is tens of minutes. A
+CNN-shaped 7B model sits near n = 4,000 and costs seconds.
+
+**Caveats, since these numbers will be quoted.** Weights are synthetic
+Gaussians, not trained, and trained weights carry structure that could move the
+cost matrix either way. Both checkpoints are passed as in-memory dicts, so peak
+RSS includes them — a real commit passes `SafetensorsReader` and mmaps, and the
+n² driver is the float32 widening, the `[n, n]` cost matrix and `residual.py`'s
+temporaries rather than the file bytes. Depth 3 throughout, one seed per point.
 
 ---
 

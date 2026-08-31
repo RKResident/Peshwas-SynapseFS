@@ -473,11 +473,36 @@ could not be solved.
 6. **BatchNorm buffers must move with their group.** Invisible under identity,
    wrong under every real permutation.
 
+## How it scales
+
+Measured with `tools/experiments/align_scaling.py`; the full tables and the
+caveats are in `ARCHITECTURE.md` §4.6.3. Three things worth carrying in your
+head:
+
+- **Time goes as n^2.50 in layer width, not n³.** The textbook bound on the
+  assignment problem is cubic, but Hungarian is fast when the cost matrix is
+  *decisive*, and a recoverable permutation is exactly that. At n = 10,000 a
+  full alignment is **50.8 s and 3.36 GB at 100% recovery**. Quote the measured
+  exponent, not the bound.
+- **Recovery survives noise up to half the weight standard deviation**, then
+  degrades smoothly — 99.5% at 0.75, 95.3% at 1.0, 80.5% at 1.5. There is no
+  cliff, and `is_alignable` starts rejecting before the answers get bad.
+- **Width and noise multiply.** Width 8192 costs 31.8 s at noise 0.01 and
+  **215.5 s at noise 1.0** — 6.8× for 2.5× the sweeps, because a less decisive
+  matrix also makes each individual solve slower. The expensive case is a hard
+  pair at a large width, not either one alone.
+
+Peak RSS is set by the widest single group, not by the model, since groups are
+solved one at a time. Wall clock scales with group count, so depth is a
+time cost and not a memory one.
+
 ## Known remaining work
 
 - **Early-out on the objective.** Comparing the solved objective against
   identity's would collapse the 5-sweep early-epoch case to 1 sweep — the
-  largest remaining win, and unbuilt.
+  largest remaining win, and unbuilt. §4.6.3 raises its value: sweep count is
+  what blows up on hard pairs (2 → 15 as noise rises), so an early-out caps the
+  worst case rather than just trimming the common one.
 - **GPU cost matrices.** Measured 3.84x on the cost build (`ARCHITECTURE.md`
   §4.6.2), with two caveats: ship fp16 and widen on the device, and leave the
   Hungarian solve on the CPU. torch must stay an optional import.
