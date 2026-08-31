@@ -21,11 +21,18 @@ PYTHONPATH=. python tools/experiments/<script>.py
 | `storage_layout.py` | §5.4 | loose chunks vs a packfile, warm and cold, sequential and threaded |
 | `memory_profile.py` | §5.4 | import baselines and codec temporaries — what a C++ port would and would not buy |
 | `align_gpu.py` | §8 | GPU moves the matmuls; the LAP solve then dominates |
+| `align_scaling.py` | §4.6.3 | cost against layer width and against noise; why it is n^2.5 and not n³, and where recovery breaks |
 
 All default to `tools/checkpoints/` (the STL-10 run). Point them elsewhere with
 `--checkpoints`, and note that **every result here is from one architecture** —
 a 3.2M CNN trained with Adam. The margins are 0.2–1.2 percentage points, small
 enough that a different model could reorder several of them.
+
+`align_scaling.py` is the exception to both sentences: it needs no checkpoints
+at all, because it *generates* MLPs with a known ground-truth permutation, and
+it is the only script here that measures behaviour outside the 92M benchmark's
+1792-unit width. Its weights are synthetic rather than trained, which is the
+trade it makes to reach n = 10,000 on a machine with 15 GB of RAM.
 
 ## Two traps these scripts were themselves caught by
 
