@@ -13,10 +13,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# torch is TEST-ONLY on purpose. It is used to prove the mount works against
-# `safetensors.torch.load_file()`, and must never be imported by the daemon --
-# it costs hundreds of MB of RSS against a graded peak-RSS metric.
+# torch is TEST/EXAMPLE-ONLY on purpose. It is used to prove the mount works against
+# `safetensors.torch.load_file()` and in interactive training notebooks.
+# It must never be imported by the daemon -- it costs hundreds of MB of RSS.
 dev = ["pytest>=8.0", "torch>=2.0"]
+examples = ["torch>=2.0", "notebook"]
 
 [project.scripts]
 synapsefs = "synapsefs.cli.main:main"
