@@ -135,12 +135,12 @@ SINT = "sint"    # two's complement.
 _DTYPES: dict[str, Tuple[int, str]] = {
     "F16": (2, FLOAT),
     "BF16": (2, FLOAT),
-    "F32": (4, FLOAT), #redundant?
+    # "F32": (4, FLOAT), #redundant?
     "I64": (8, SINT),
 }
 
-_UINT_OF = {2: np.uint16, 4: np.uint32, 8: np.uint64}
-
+# _UINT_OF = {2: np.uint16, 4: np.uint32, 8: np.uint64}
+_UINT_OF = {2: np.uint16, 8: np.uint64}
 
 def dtype_spec(dtype: str) -> Tuple[int, str]:
     """Map a safetensors dtype name to `(element_width_bytes, key_kind)`.
@@ -188,6 +188,7 @@ def _mask_inverse(key: np.ndarray, kind: str, msb, one, zero, shift) -> np.ndarr
 
 def _consts(width: int):
     u = _UINT_OF[width]
+    # 0, 1, msb, num_bits-1,
     return u(0), u(1), u(1 << (width * 8 - 1)), u(width * 8 - 1)
 
 
@@ -717,3 +718,25 @@ def decode_chunk(
             to_monotone_key(b_bits, kind) + unzigzag(residual), kind
         )
     return (b_bits + residual).astype(unsigned, copy=False)
+
+#
+if __name__ == "__main__":
+    import numpy as np
+
+    bits = np.array([
+        0x0000,  # +0
+        0x3C00,  # +1.0
+        0x4000,  # +2.0
+        0x8000,  # -0
+        0xBC00,  # -1.0
+        0xC000,  # -2.0
+    ], dtype=np.uint16)
+
+    zero, one, msb, shift = _consts(2)
+
+    print("zero:", zero)
+    print("one :", one)
+    print("msb :", hex(int(msb)))
+    print("shift:", shift)
+
+    print(_mask_forward(bits, 'F16', msb, zero, shift))
