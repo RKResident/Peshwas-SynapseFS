@@ -36,3 +36,13 @@ lint:
 
 clean-fixtures:
 	rm -rf fixtures/
+
+CXX ?= c++
+CXXFLAGS := -std=c++17 -02
+
+.PHONY build-cpp
+
+build-cpp:
+	$(CXX) $(CXXFLAGS) cpp/spp.cpp -o cpp/spp
+
+

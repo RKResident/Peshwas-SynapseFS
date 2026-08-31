@@ -14,6 +14,7 @@ cpp/spp
 # difference between a clone and an accident.
 data/
 checkpoints/
+chunk_export/
 
 # --- Repositories created during manual testing ------------------------------
 .synapse/
@@ -41,6 +42,7 @@ dist/
 .venv/
 venv/
 env/
+.nvim/
 
 # --- Editors -----------------------------------------------------------------
 .idea/
