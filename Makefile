@@ -9,13 +9,14 @@
 PY  := .venv/bin/python
 RUN := PYTHONPATH= $(PY)
 
-.PHONY: help test fixtures fixtures-small fixtures-all lint clean-fixtures
+.PHONY: help test fixtures fixtures-small fixtures-all lint clean-fixtures network
 
 help:
 	@echo "make test            - run the test suite"
 	@echo "make fixtures        - generate tiny mlp+cnn fixtures (fast, for unit tests)"
 	@echo "make fixtures-small  - generate small mlp+cnn fixtures (for benchmarks)"
 	@echo "make fixtures-all    - tiny + small, both architectures"
+	@echo "make network        - build the C++ push/pull transfer tool"
 	@echo "make clean-fixtures  - delete generated fixtures"
 
 test:
@@ -36,3 +37,9 @@ lint:
 
 clean-fixtures:
 	rm -rf fixtures/
+
+# The transfer tool is C++ and standalone on purpose: a machine can host a repo
+# without a Python environment. It is not part of the Python package -- there is
+# no __init__.py, so setuptools does not pick it up.
+network:
+	g++ -std=c++17 -O2 -o synapsefs/networking/spp synapsefs/networking/spp.cpp

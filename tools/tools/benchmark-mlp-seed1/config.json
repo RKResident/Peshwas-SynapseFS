@@ -1,0 +1,11 @@
+{
+  "architecture": "PlainMLP",
+  "widths": [
+    4096,
+    4096,
+    2048,
+    1024
+  ],
+  "num_classes": 100,
+  "in_features": 3072
+}

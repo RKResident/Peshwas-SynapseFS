@@ -38,6 +38,34 @@ CAVEAT = [
     "    that needs evaluation on data, which a storage system does not have.",
 ]
 
+#: Printed only when normalisation buffers were averaged. Kept separate from
+#: CAVEAT because it is not a caveat -- it is a defect in the output that the
+#: user can repair, and it names the tensors to repair.
+RECALIBRATE = [
+    "warning: this merge contains averaged activation statistics, which are wrong.",
+    "         'running_mean' and 'running_var' measure what flowed through each",
+    "         PARENT. The merged network is a different function, so its true",
+    "         statistics were never present in either parent and no average of",
+    "         them recovers it.",
+    "",
+    "         Fix by resetting those buffers and re-estimating from training",
+    "         data before using or evaluating the model:",
+    "",
+    "             for m in model.modules():",
+    "                 if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):",
+    "                     m.reset_running_stats()",
+    "                     m.momentum = None      # cumulative average",
+    "             model.train()",
+    "             with torch.no_grad():",
+    "                 for i, (x, _) in enumerate(train_loader):",
+    "                     if i >= 100: break",
+    "                     model(x)",
+    "",
+    "         Measured on two independently trained MNIST classifiers, merged",
+    "         after alignment: 95.81% before recalibration, 98.15% after,",
+    "         against parents at 98.47% / 98.44%.",
+]
+
 
 def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
     parser = subparsers.add_parser(
@@ -185,6 +213,7 @@ def run(args: argparse.Namespace) -> dict:
         "tensors": len(plan.decisions), "resolution": plan.counts(),
         "conflicts": plan.conflicts,
         "averaged": len(plan.conflicts),
+        "stale_statistics": plan.stale_statistics,
         "alignment": align_result.as_json() if align_result else None,
         "bytes": written["total_bytes"],
         "notes": notes,
@@ -211,6 +240,13 @@ def format_human(result: dict) -> str:
     if result["averaged"]:
         lines.append("")
         lines.extend(CAVEAT)
+    stale = result.get("stale_statistics") or []
+    if stale:
+        lines.append("")
+        lines.extend(RECALIBRATE)
+        shown = ", ".join(stale[:4])
+        more = f", and {len(stale) - 4} more" if len(stale) > 4 else ""
+        lines.append(f"         affected ({len(stale)}): {shown}{more}")
     for n in result.get("notes", []):
         lines.append(f"  note: {n}")
     return "\n".join(lines)

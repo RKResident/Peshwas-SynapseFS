@@ -18,6 +18,7 @@ job, not this command module's.
 from __future__ import annotations
 
 import argparse
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -76,6 +77,12 @@ def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
              " current HEAD. Ignored on the root commit.",
     )
     parser.add_argument(
+        "--timing", action="store_true",
+        help="Report wall-clock per phase. Alignment and encoding scale with "
+             "different things -- the solver with unit counts, the codec with "
+             "bytes -- so a single total hides which one moved.",
+    )
+    parser.add_argument(
         "--no-align", action="store_true",
         help="Skip permutation matching; assume identity.",
     )
@@ -119,6 +126,9 @@ def run(args: argparse.Namespace) -> dict:
       -- invisible, harmless, and collected later. The PS's crash requirement
       (module 2h) is satisfied by that ordering, not by a transaction.
     """
+    started = time.perf_counter()
+    timings: dict = {}
+
     repo = Repo.find(args.repo)
 
     checkpoint = Path(args.checkpoint)
@@ -178,10 +188,12 @@ def run(args: argparse.Namespace) -> dict:
         None if store_full else graph.CommitCheckpoint(store, anchor)
     )
 
+    _t = time.perf_counter()
     alignment, align_result = _align(
         store, checkpoint, base_source, config_path,
         no_align=args.no_align, notes=notes,
     )
+    timings["align"] = time.perf_counter() - _t
     # FORMAT.md 12A's dynamic re-base, now that we can actually detect the
     # trigger. `nearest_full_ancestor` walks first parents for a FULL commit,
     # which across a branch boundary can land on a *different model*: branch
@@ -216,6 +228,7 @@ def run(args: argparse.Namespace) -> dict:
     # crash leaves valid reusable chunks rather than a half-written container
     # that has to be discarded -- and `already_have` is a stat, not an index
     # probe.
+    _t = time.perf_counter()
     encoded = encode_checkpoint(
         checkpoint,
         base_source,
@@ -229,6 +242,11 @@ def run(args: argparse.Namespace) -> dict:
         **({} if args.chunk_size is None
            else {"chunk_size_bytes": args.chunk_size}),
     )
+    # Encoding covers reading the checkpoint, subtracting, compressing and
+    # writing every chunk object -- the emit callback stores as it goes, so
+    # there is no separate "write chunks" phase to attribute.
+    timings["encode"] = time.perf_counter() - _t
+    _t = time.perf_counter()
 
     topology_config_hash = _resolve_config(store, config_path, base_hash)
 
@@ -253,9 +271,11 @@ def run(args: argparse.Namespace) -> dict:
     )
 
     repo.update_ref(branch, commit_hash)
+    timings["write"] = time.perf_counter() - _t
+    timings["total"] = time.perf_counter() - started
 
     original = encoded.original_bytes
-    return {
+    result = {
         "commit": commit_hash,
         "branch": branch,
         "base": None if store_full else anchor,
@@ -277,6 +297,9 @@ def run(args: argparse.Namespace) -> dict:
         ),
         "notes": encoded.notes + notes,
     }
+    if getattr(args, "timing", False):
+        result["timing_s"] = {k: round(v, 3) for k, v in timings.items()}
+    return result
 
 
 def _align(store, checkpoint: Path, base_source, config_path: Path,
@@ -410,6 +433,20 @@ def format_human(result: dict) -> str:
         f"  new chunks: {result.get('chunks_new', 0)}   "
         f"deduped: {result.get('chunks_deduped', 0)}"
     )
+    # Phase timings, only under --timing. Alignment scales with unit counts and
+    # encoding with bytes, so they move independently and a single total hides
+    # which one did: a fine-tune that suddenly takes minutes is the solver
+    # failing to converge, not the codec getting slower.
+    t = result.get("timing_s") or {}
+    if t:
+        total = t.get("total") or 0.0
+        lines.append("  timing")
+        for phase in ("align", "encode", "write"):
+            if phase in t:
+                share = f"{t[phase] / total * 100:4.0f}%" if total else "    "
+                lines.append(f"    {phase:<7}{t[phase]:8.2f}s {share}")
+        lines.append(f"    {'total':<7}{total:8.2f}s")
+
     commit_hash = (result.get("commit") or "??????")[:6]
     lines.append(
         f"[{result.get('branch', '?')} {commit_hash}] {result.get('message', '')}"

@@ -52,6 +52,7 @@ Identity is None, never arange(n): a None perm skips the gather entirely.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Mapping, Protocol, Sequence
 
 import numpy as np
@@ -81,21 +82,59 @@ def as_matrix(arr: np.ndarray) -> np.ndarray:
     return a.reshape(a.shape[0], -1)
 
 
+#: Bytes of widened float32 a `MatrixPair` may hold. The whole point is that
+#: this is a CAP rather than a switch: a 92M model fits entirely and converts
+#: each tensor once, a 7B model keeps what it can and degrades to re-reading
+#: the rest, and neither has to be configured.
+#:
+#: 1 GiB covers both sides of the 92M benchmark (176 MiB fp16 -> 352 MiB fp32,
+#: twice) with room to spare.
+DEFAULT_CACHE_BYTES = 1 << 30
+
+
 class MatrixPair:
     """Adapts a pair of SafetensorsReaders, or a pair of {name: array} dicts.
 
-    Uncached by default: a 7B group holds several hundred MB of float32 and the
-    solver revisits every group each sweep. Cache only for small models.
+    Widening fp16/bf16 to float32 is the single most expensive thing the
+    solver does -- 51.6% of an alignment, more than the matmuls (23%) and far
+    more than the Hungarian solve (2.3%). It is also almost entirely wasted:
+    one sweep over the 92M benchmark performed 694 conversions of 144 distinct
+    (tensor, side) pairs, because every group re-reads its members, a tensor
+    that is a row member of one group and a column member of another is
+    converted twice, and the norm and residual passes convert them again.
+
+    So the cache is bounded rather than optional. It was previously off by
+    default with a note to enable it "only for small models", which is right
+    about 7B and wrong about everything this actually runs, and left a 4.8x
+    redundancy on the dominant cost. Eviction is least-recently-used by bytes,
+    the same shape as `fuse/cache.py`.
     """
 
-    def __init__(self, base: object, target: object, cache: bool = False) -> None:
+    def __init__(self, base: object, target: object, cache: bool = True,
+                 max_bytes: int = DEFAULT_CACHE_BYTES) -> None:
         self._base, self._target = base, target
-        self._cache: dict[tuple[str, str], np.ndarray] | None = {} if cache else None
+        self._max_bytes = max_bytes if cache else 0
+        self._bytes = 0
+        self._cache: "OrderedDict[tuple[str, str], np.ndarray]" = OrderedDict()
         self._scales: dict[str, float] = {}
 
+    def _remember(self, key: "tuple[str, str]", mat: np.ndarray) -> None:
+        if self._max_bytes <= 0 or mat.nbytes > self._max_bytes:
+            # A single tensor larger than the whole budget would evict
+            # everything else to store itself and then be evicted in turn.
+            return
+        while self._bytes + mat.nbytes > self._max_bytes and self._cache:
+            _, evicted = self._cache.popitem(last=False)
+            self._bytes -= evicted.nbytes
+        self._cache[key] = mat
+        self._bytes += mat.nbytes
+
     def _fetch(self, side: str, src: object, name: str) -> np.ndarray:
-        if self._cache is not None and (side, name) in self._cache:
-            return self._cache[(side, name)]
+        key = (side, name)
+        hit = self._cache.get(key)
+        if hit is not None:
+            self._cache.move_to_end(key)
+            return hit
         getter = getattr(src, "as_float", None)
         if getter is not None:
             mat = as_matrix(getter(name))
@@ -104,8 +143,7 @@ class MatrixPair:
                 mat = as_matrix(src[name])  # type: ignore[index]
             except KeyError:
                 raise KeyError(f"{side} source has no tensor '{name}'") from None
-        if self._cache is not None:
-            self._cache[(side, name)] = mat
+        self._remember(key, mat)
         return mat
 
     def base(self, name: str) -> np.ndarray:

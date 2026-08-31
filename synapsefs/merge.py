@@ -61,6 +61,11 @@ class TensorDecision:
     detail: str = ""
 
 
+#: Buffers that describe a network's ACTIVATION statistics rather than its
+#: weights. BatchNorm's names in PyTorch; other frameworks spell them the same.
+ACTIVATION_BUFFERS = ("running_mean", "running_var")
+
+
 @dataclass
 class MergePlan:
     base: Optional[str]
@@ -71,6 +76,32 @@ class MergePlan:
     @property
     def conflicts(self) -> List[str]:
         return [n for n, d in self.decisions.items() if d.action == AVERAGED]
+
+    @property
+    def stale_statistics(self) -> List[str]:
+        """Averaged buffers whose values describe the PARENTS, not the merge.
+
+        `running_mean` and `running_var` are measurements of what flowed
+        through each parent network. The merged network is a different
+        function, so its activations have different statistics and the
+        averaged buffers are simply wrong -- not approximately wrong, wrong in
+        a way that no arithmetic on the parents can fix, because the right
+        values were never present in either.
+
+        The only cure is to run data through the merged model with the buffers
+        reset and re-measure. That needs a training set and forward passes,
+        which a storage system does not have, so this reports the problem
+        rather than solving it.
+
+        Measured on two independently trained MNIST classifiers, aligned and
+        averaged: 95.81% with the inherited buffers, 98.15% after
+        recalibration, against parents at 98.47% and 98.44%. The naive
+        (unaligned) merge moves 60.95% -> 95.45%. Both are large enough to
+        change what someone concludes about the merge.
+        """
+        return sorted(n for n, d in self.decisions.items()
+                      if d.action == AVERAGED
+                      and n.rsplit(".", 1)[-1] in ACTIVATION_BUFFERS)
 
     def counts(self) -> Dict[str, int]:
         out: Dict[str, int] = {}

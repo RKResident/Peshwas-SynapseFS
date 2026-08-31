@@ -50,7 +50,20 @@ def relative_residual(target: np.ndarray, base: np.ndarray) -> float:
     scale = norm(t)
     if scale == 0.0:
         return 0.0 if np.array_equal(t, b) else float("inf")
-    return norm(t.astype(np.float64) - b.astype(np.float64)) / scale
+    # Subtract at the input width and let `norm` accumulate in float64.
+    #
+    # Widening both operands first made the subtraction exact, and bought
+    # nothing: what the float64 accumulator is protecting against is drift over
+    # ten million ADDITIONS, which `norm`'s einsum already handles whatever the
+    # input dtype is. An elementwise float32 subtraction is correctly rounded,
+    # so the error is at most one float32 ULP per element -- invisible against
+    # a ratio compared to a 0.9 threshold.
+    #
+    # It was not free. Two float64 temporaries per call, 144 calls per
+    # alignment, 231 MiB apiece for the largest tensor: 40% of the runtime
+    # after the matrix cache landed, and the single largest allocator in the
+    # solver.
+    return norm(t - b) / scale
 
 
 def improvement(pre: float, post: float) -> float:

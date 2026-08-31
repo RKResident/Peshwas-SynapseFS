@@ -25,6 +25,9 @@ codebase. This document assumes all of it.
 | companion doc | covers |
 |---|---|
 | `PRIMER.md` | the ideas and vocabulary, for someone new |
+| `SYSTEMS_PRIMER.md` | FUSE, inodes, caching, RSS, threads — assumes no systems background |
+| `FUSE.md` | `synapsefs/fuse/`, file by file and function by function |
+| `ALIGNMENT.md` | `synapsefs/align/`, file by file and function by function |
 | `FORMAT.md` | the same formats, with more design rationale and history |
 | `CLI.md` | command surface, flags, exit codes |
 | `INDEX_V2.md`, `CHUNK_STORE.md` | proposed alternatives, not implemented |
@@ -56,7 +59,7 @@ Everything else follows from defending that guarantee cheaply:
 | PS module | grade | state |
 |---|---|---|
 | 1 Alignment & compression | 25% | codec done; aligner **wired in** (§8) |
-| 2 Filesystem (FUSE) | 25% | implementation merged in from the fuse-mount branch; **never run as a live mount since the storage change** |
+| 2 Filesystem (FUSE) | 25% | run live: mounts, lists, and reads back byte-identical for full and residual commits at 206 MiB/s (§4.4.1). `forget()` and the inode index were also missing |
 | 3 Cryptographic integrity | 20% | done (tiers to be re-based on §4.5.2) |
 | 4 Networking & CLI | 15% | CLI complete incl. `merge`; `push`/`pull`/`serve` exist outside this tree, not merged in yet |
 | 5 Documentation | 15% | this + `PRIMER.md` + `FORMAT.md` + `CLI.md`; **no README yet** |
@@ -382,20 +385,49 @@ To read those rows:
 4. **Interpret the stream**, again by `encoding`:
    - `raw-shuffle-zstd` → un-shuffle and you have the tensor's bit patterns,
      little-endian, row-major. Done.
+   - `delta-zigzag-escape-zstd` → parse the two planes, un-zigzag, add to base
    - `delta-shuffle-zstd` → un-shuffle, then treat as a **residual**, not
      values. Fetch the same row range from
      `base_tensor_manifest`, convert both to monotone keys, add, convert back
      (§4.1).
 
-#### The two encodings, and what the payload actually holds
+#### The encodings, and what the payload actually holds
 
 | `encoding` | bytes `0..4` | after decompression you hold |
 |---|---|---|
 | `raw-shuffle-zstd` | `28 b5 2f fd` | byte-shuffled tensor bit patterns |
 | `delta-shuffle-zstd` | `28 b5 2f fd` | byte-shuffled residual stream |
+| `delta-zigzag-escape-zstd` | `28 b5 2f fd` | the escape layout below |
 | `raw` | *(no frame)* | tensor bit patterns, unshuffled |
 | `raw-zstd` *(legacy)* | `28 b5 2f fd` | tensor bit patterns, unshuffled |
 | `delta-zigzag-zstd` *(legacy)* | `28 b5 2f fd` | zigzag residual, unshuffled |
+
+#### `delta-zigzag-escape-zstd`, byte for byte
+
+The decompressed stream is **not** one uniform block. It has internal
+structure, and it is the only encoding of which that is true:
+
+| offset | size | content |
+|---|---|---|
+| `0` | `8` | `narrow_len`, `uint64` little-endian — the element count |
+| `8` | `narrow_len` | the **narrow plane**: one byte per element |
+| `8 + narrow_len` | rest | the **wide plane**: byte-shuffled `uint16` |
+
+A narrow byte is the zigzag residual itself when it is `0..254`, or `0xFF` to
+say "this one did not fit". The escaped values appear in the wide plane in
+element order, one `uint16` each, and the number of them must equal the number
+of `0xFF` markers — a mismatch is corruption and raises.
+
+`content_hash` covers this whole stream, prefix included, exactly as for the
+other encodings. Both planes go in **one** zstd frame; two separate frames
+measured identically (−0.00pp) and would have split the hash across two blobs.
+
+The wide plane is kept out of line rather than spliced in after each marker.
+That is worth **2.6pp**: an oversized value dropped between small ones breaks
+the run the compressor was matching on.
+
+Decoding is a single pass — read a byte, take it or pull the next `uint16` from
+the wide plane, then un-zigzag and add to the base.
 
 In all three cases the decompressed length is `plain_len`, and it always equals
 `(row_end - row_start + 1) × cols × width` — the residual stream is exactly the
@@ -644,6 +676,66 @@ each plane gets its own entropy model. The low plane can then be stored
 uncompressed for the same size and better throughput — it is 8.0-bit noise.
 Worth doing; not yet done.
 
+#### 4.1.3 Everything above is conditional on the mantissa width
+
+Read that section as *"measured on fp16"*, because it was, and several of its
+conclusions **reverse on bf16**. Both formats are two bytes; they split them
+differently — fp16 is 1 sign / 5 exponent / 10 mantissa, bf16 is 1 / 8 / 7 —
+and the byte shuffle therefore cuts in a different place.
+
+That changes two things at once. bf16's high byte is sign plus exponent and no
+mantissa at all, so it is pure structure; and with three fewer mantissa bits
+the same weight movement is ~8× fewer ULPs, so the residuals themselves are
+far smaller.
+
+| | fp16 | bf16 |
+|---|---|---|
+| high plane (zstd / H₀) | 45.20% / 4.44 bits | **27.36% / 1.55 bits** |
+| low plane (zstd / H₀) | 100.00% / 8.00 bits | 94.66% / 7.53 bits |
+| combined | 72.60% | 61.01% |
+| median residual, gap 1 | 510 ULP | **27 ULP** |
+| residuals fitting in a byte (zigzag) | 35.3% | **86.5%** |
+
+The 100.00% low plane that bounded §4.1.2's headroom argument is an **fp16
+artifact**, not a law: bf16's low byte carries an exponent bit, which is
+structured, and it compresses.
+
+Consequences, all measured at gap 1 on the 92M benchmark:
+
+| scheme | fp16 | bf16 |
+|---|---|---|
+| byte shuffle (the fp16 answer) | **72.56%** | 60.88% |
+| zigzag + byte shuffle | 72.48% | 56.79% |
+| zigzag + PFor bitmap | 71.65% | 52.77% |
+| zigzag + escape byte, wide plane split | 74.32% | **52.72%** |
+
+**Zigzag was removed from the codec for losing on fp16** (−0.08pp at gap 1,
++0.07pp at gap 3 — noise) and is now essential: it is what lets a *negative*
+residual fit in the narrow plane at all, taking the fitting fraction from
+51.2% to 86.5%. **PFor** was measured at −1.2pp on fp16 and never implemented;
+on bf16 it is worth −8pp. The **escape byte** was rejected outright on fp16
+and now ties PFor.
+
+The flag width turns out not to matter — an 8-bit `0xFF` marker and a 1-bit
+bitmap entry land within 0.05pp — while the **layout** is worth 2.6pp. Same
+lesson as bit-shuffling, sub-byte planes, Elf and per-field deltas:
+homogeneous byte streams compress, mixed ones do not.
+
+XOR was re-checked against the new encoding and loses: median 63 against
+subtraction's 26 at gap 1, because an XOR's magnitude is the position of the
+highest differing bit rather than a distance, so it jumps to the next power of
+two at every carry boundary. It *beat* subtraction under plain byte shuffle at
+gap 1 (60.63% vs 60.88%), which is a reminder that the old ablation's XOR
+column is no longer a guide.
+
+**Selection is per chunk, by counting, not by dtype.** An element costs 1 byte
+when it fits and 3 when it escapes, so the mean is `3 − 2p` and only beats a
+2-byte residual when `p > 0.5`. Measured crossover sits between 46.1% and
+64.7% escape, where the arithmetic says it should. A dtype rule would store
+5pp *worse* than the old codec on a bf16 commit whose base is a distant anchor
+(82.9% escape at gap 24) — a case the star topology produces whenever the
+rebase interval widens.
+
 ### 4.2 Chunking
 
 ```
@@ -759,6 +851,64 @@ not alignable against the anchor, the anchor is a *different model* (a diverged
 branch), so this commit is stored full and becomes the branch's own hub. See
 `UNUSABLE_ANCHOR_FRACTION` in `cli/commands/commit.py`.
 
+#### 4.3.1 Considered and rejected: bidirectional prediction (B-frames)
+
+In video terms the star is I-frames and P-frames, and the missing third kind is
+a **B-frame** -- predicted from a frame on each side rather than one behind.
+Over a rebase interval with anchors at both ends, bisect: predict the middle
+from the two anchors, then each quarter from its neighbours.
+
+It is not the second-order delta rejected in §4.1: that extrapolated *forward*
+(`x[k] - 2x[k-1] + x[k-2]`), compounding two steps of noise in one direction,
+and cost +3.83pp. A **centred** estimate averages two independent errors
+instead of stacking them, halving the variance rather than doubling it. Same
+ingredients, opposite sign -- which is why it was worth measuring separately.
+
+Measured over one interval (anchors at 21 and 25, epochs 22-24 stored):
+
+| | star | chain | dyadic B |
+|---|---|---|---|
+| bf16 | 55.40% | 52.97% | **51.05%** |
+| fp16 | 74.48% | 72.75% | **71.57%** |
+
+It beats **both** existing layouts on both dtypes -- −4.35pp against the star
+on bf16 -- at decode depth 2 (star is 1, chain is 3). Confirmed independently
+against the shipping codec: 52.72% → 49.96% on bf16, 72.57% → 70.94% on fp16.
+
+**It is not implemented, and the reason is workflow, not compression.**
+
+A B-frame for epoch 22 is predicted from 21 and *23*. The natural workflow is
+to commit as you train, and when epoch 22 finishes, 23 does not exist. Three
+ways out, all with a real cost:
+
+1. **One-epoch lag** -- hold the newest checkpoint, commit it once its
+   successor exists. Two checkpoints on disk, which you have anyway, but the
+   newest is uncommitted for one epoch and a crash loses it.
+2. **Import a finished run** -- commit all of it at once in dyadic order.
+   Clean, but it needs every checkpoint on disk simultaneously (4.4 GB for the
+   92M benchmark), which is what the system exists to avoid.
+3. **Repack afterwards** -- and the format forbids it. See below.
+
+Against a −2.8pp gain: a user-visible flag whose correct use is non-obvious,
+and a decode path that needs two parents per chunk, which slows the FUSE read
+the PS weights at 25% with mmap throughput at 8%. A storage win that costs read
+speed is the wrong trade here.
+
+**The deeper lesson is the repack one.** `base_tensor_manifest` lives *inside*
+the tensor manifest, which is itself content-addressed -- so changing a base
+changes the manifest hash, the checkpoint-manifest hash, and the commit hash.
+Repacking would rewrite history.
+
+That is a design mistake worth naming. Git keeps content identity and storage
+layout **separate**: an object's hash is its content, packing is orthogonal,
+and `git gc` repacks without touching a single commit hash. Had commits
+referenced tensors by `content_hash` with a separate index recording *how* each
+is materialised, B-frames would be a background optimisation nobody has to
+think about, and the star/chain/dyadic choice would be revisable after the fact
+rather than baked in at commit time.
+
+Reproduce with `tools/experiments/bframes.py`.
+
 ### 4.4 Reconstruction
 
 To rebuild a tensor's rows `[start, stop)`:
@@ -776,6 +926,86 @@ slice the concatenation back down to [start, stop)
 
 Only overlapping chunks are fetched — the property the FUSE read path depends
 on. Under the star the recursion is depth 1.
+
+#### 4.4.1 Two mistakes that cost 13× between them
+
+Both were found by mounting the filesystem and copying a file off it. Neither
+appears in the test suite, because the fixtures are small enough that a tensor
+has one chunk and neither condition can arise. A live mount is a test the unit
+tests cannot replace.
+
+**Key the chunk cache on the chunk.** It was keyed on `(commit, tensor, start_row,
+end_row)` — the *request*. The kernel issues 128 KiB reads against 4 MiB chunks,
+so every read produced a fresh key, missed, and decoded the whole chunk to
+return 3% of it:
+
+| | object fetches | bytes read | time |
+|---|---|---|---|
+| whole-file read | 369 | 277.7 MiB | 2.4 s |
+| 128 KiB reads, request-keyed | 3,189 | **8,761.8 MiB** | 297.8 s |
+| 128 KiB reads, chunk-keyed | 369 | 277.7 MiB | 1.5 s |
+
+`CommitCheckpoint.chunk_spans()` exposes the boundaries and `_get_rows` snaps
+requests outward to them. The general rule: **a cache key must describe the
+unit of work performed, not the unit requested.**
+
+**Do not `.copy()` a transposed array.** `unshuffle` was
+`a.reshape(width, -1).T.copy().tobytes()`. `reshape` and `.T` are free views;
+copying a *transposed* array is not — the output is contiguous while the input
+has stride N, so numpy falls back to a generic strided iterator and moves one
+byte at a time. 10.92 ms per 4 MiB chunk, **59% of the whole read path**, four
+times the cost of the decompression it supports.
+
+Assigning one plane at a time is the same permutation written so numpy can
+vectorise it — `width` contiguous reads with strided writes instead of one
+element-wise transpose — and returning the array rather than `bytes` removes a
+second full copy the caller was about to undo with `np.frombuffer`:
+
+| | per 4 MiB chunk | throughput |
+|---|---|---|
+| `.T.copy().tobytes()` | 10.92 ms | 366 MiB/s |
+| plane assign → `bytes` | 2.07 ms | 1929 MiB/s |
+| plane assign → `uint16` array | **1.77 ms** | **2263 MiB/s** |
+
+A third, smaller one in the same path: `(b_bits + residual).astype(unsigned)`
+allocated a whole extra buffer, because both operands are already that dtype
+and `.astype` copies unconditionally. `copy=False` removes it — 14% of the
+remaining time.
+
+Together, on a 177 MiB checkpoint through a live mount:
+
+| | wall | throughput |
+|---|---|---|
+| before | 11.14 s | 16 MiB/s |
+| chunk-keyed cache | 2.41 s | 73 MiB/s |
+| + fixed `unshuffle` | 1.23 s | 144 MiB/s |
+| + `copy=False` | **0.86 s** | **206 MiB/s** |
+
+For reference `restore`, which does not go through FUSE at all, takes 4.05 s
+for the same commit — the mount is now the faster path, because reads overlap
+with the copy.
+
+#### 4.4.2 Is a C++ port worth it?
+
+Not for speed. After the above, the read path splits roughly 65% real work
+(zstd, numpy, file I/O — all already compiled) against 35% attributed to
+Python frames, and that 35% is an *upper* bound on what a port could remove
+because numpy operator dispatch inside those frames is counted as Python.
+zstd decompression alone is 31%, and C++ cannot beat C at it.
+
+The honest argument for C++ is **memory**. Each chunk currently allocates
+compressed bytes, decompressed bytes, an unshuffled array, base rows and a
+result. A preallocated per-thread arena gets that to two buffers and zero
+allocation in the read path.
+
+If it is attempted, do it bottom-up and stop when the numbers stop justifying
+the next step: fix the numpy shapes (done, 2.8×), parallelise chunk decode
+(threads suffice — `zstandard` releases the GIL), then a pybind11 module for
+`decode_chunk` alone, then `CommitCheckpoint.rows` with mmap. A full libfuse3
+daemon comes last and probably never: it would have to reimplement the
+manifest walk, the object store, five encodings and the safetensors parser —
+~1,000 lines of Python becoming ~2,500 of C++, with every format change then
+made twice and kept bit-compatible.
 
 To rebuild a whole **file** byte-exactly:
 
@@ -947,6 +1177,48 @@ full-rank term breaks the ties. Effects:
 
 The fine-tune fast path — "sweep 1 changed nothing, stop" — only began firing
 on real data once this was fixed.
+
+#### 4.6.1a Where the time actually goes
+
+Neither the Hungarian solve nor the matmuls. Profiling one alignment of the
+92M benchmark:
+
+| | before | after |
+|---|---|---|
+| widening fp16/bf16 -> float32 | 7.69 s (51.6%) | 1.6 s |
+| `group_cost` matmuls | 3.45 s (23.1%) | unchanged |
+| `linear_sum_assignment` | 0.35 s (2.3%) | unchanged |
+| **one-sweep alignment** | **15.2 s** | **6.0 s** |
+| five-sweep (early epochs) | 58.3 s | 34.7 s |
+
+Two fixes, and the second was larger than the first.
+
+**`MatrixPair` was uncached.** One sweep performed **694 conversions of 144
+distinct (tensor, side) pairs** — each group re-reads its members, a tensor in
+two groups converts twice, and the norm and residual passes convert everything
+again. It is now a byte-bounded LRU (`DEFAULT_CACHE_BYTES = 1 GiB`), the same
+shape as `fuse/cache.py`. A cap rather than a switch: a 92M model caches
+everything, a 7B model keeps what fits and degrades to re-reading the rest.
+
+Alone this was only **1.36x**, which is why the profile was taken again.
+
+**`relative_residual` widened to float64 before subtracting.** Two full float64
+temporaries per call — 231 MiB each for the largest tensor — 144 calls per
+alignment, **40% of the runtime** once the cache landed. The float64 exists to
+protect the *accumulation*, which `norm`'s `einsum(..., dtype=np.float64)`
+already does whatever the input dtype. Subtracting at float32 and letting
+`norm` accumulate changes the answer by **2e-13** against a threshold of 0.9.
+
+> Profile, fix the top item, profile again. The second bottleneck is invisible
+> until the first is gone.
+
+**A sweep is not free.** "Identity permutation detected — fast path" means
+descent converged on sweep *1*; that sweep still built every cost matrix and
+ran every solve. Late-epoch pairs converge in 1 sweep (~6 s); early ones take 5
+(~35 s) and still land on identity, because early weights move enough to flip a
+group before it settles back. An early-out comparing the solved objective
+against identity's would collapse those — the largest remaining win here, and
+unbuilt.
 
 #### 4.6.2 GPU: worth it, but only after 4.6.1
 
@@ -1136,7 +1408,9 @@ before reading any of it gets 302 → 209 µs/chunk on its own.
 
 **Cache decoded chunks in the FUSE daemon.** A 4 MiB chunk serves ~32 reads of
 128 KiB, so fetch cost amortises toward zero and the gap all but disappears.
-You need this cache regardless of layout.
+You need this cache regardless of layout — **and it must be keyed on the
+chunk, not on the request**. See §4.4.1: keying it on the requested row range
+looks equivalent and silently disables the cache entirely.
 
 #### What it buys
 
@@ -1242,6 +1516,57 @@ default on `--json` silently clobbers a `--json` given before the subcommand.
 Use `default=argparse.SUPPRESS` and apply baselines after parsing.
 `set_defaults()` does not help — `parents=` shares Action objects rather than
 copying them.
+
+### 5.10 `networking/` — C++, standalone
+
+`push`, `pull` and `serve` between two repositories over TCP. Built with
+`make network`; there is no `__init__.py`, so setuptools does not treat it as
+part of the Python package. It is C++ so a machine can host a repo without a
+Python environment.
+
+**Run it from inside `.synapse/`.** Every path it uses is relative
+(`objects/...`, `refs/heads/...`), so the working directory *is* how it finds
+the repo. From the repo root it silently finds nothing.
+
+The protocol is git's negotiation. The side holding the branch walks the object
+graph from the tip and computes the closure — commit -> checkpoint manifest ->
+header, config and tensor manifests -> permutations and chunks, following
+`parents` and `base_tensor_manifest` recursively — sends that hash list, the
+peer replies with one byte per hash saying which it already has, and only the
+missing objects go over the wire. A second push of a 25-epoch run transfers
+almost nothing. Objects are received to `<path>.tmp` and renamed, so an
+interrupted transfer leaves a complete object or none.
+
+**It does not verify what it receives.** Bytes are written to the path named by
+the hash the *sender claimed*, and never re-hashed. §4.5's trust chain rests on
+every hash being checked against the value its parent named, and this layer
+bypasses it. Hashes off the wire are validated as 64 lowercase hex characters —
+a path-traversal guard, not an integrity check. **Run `synapsefs verify` after
+a pull**; it is ref-anchored and runs at 544 MiB/s.
+
+Five bugs found by running it against a real repo, all now fixed and worth
+knowing because four are re-implementation drift:
+
+| bug | consequence |
+|---|---|
+| `objects/<ab>/<62>` and a separate `objects/chunks/` subtree | every open failed; a pull transferred **nothing** |
+| chunk loop bounded by `rho_len`, predicate `has_hash` | re-sent chunks; heap overflow if objects > chunks |
+| `req_hash_objects.back()` on an empty vector | segfault whenever the peer sent nothing |
+| `topology_config_hash` absent from the DAG walk | `config.json` never transferred; `log` worked, `verify` failed |
+| `spp.cpp` negated the return value | success exited 1, failure exited 0 |
+
+The paths were the packfile-era layout from the superseded `CHUNK_STORE.md`. A
+Python implementation importing `ObjectStore.path_for` could not have had that
+bug, or the config one — which is the argument for keeping the transport thin
+and the format knowledge in one place.
+
+**Was C++ worth it?** For speed, no: `send_file` reads a whole file into a
+buffer then sends it, where `sendfile(2)` moves it in-kernel. Measured on
+localhost, 1113 MiB/s buffered against 4638 MiB/s zero-copy — Python's stdlib
+`socket.sendfile()` is 4.2x faster than what this does, in the slower language,
+because the syscall pattern is what is being measured. Everything else here is
+I/O-bound or kilobytes. The real argument is deployment: no Python needed on
+the server.
 
 ---
 

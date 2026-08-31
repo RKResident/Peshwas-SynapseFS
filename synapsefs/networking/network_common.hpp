@@ -1,0 +1,283 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <netinet/in.h>
+#include <stdexcept>
+#include <sys/socket.h>
+#include <system_error>
+#include <vector>
+#include <unordered_set>
+
+const int hash_len = 64;
+
+enum Operation {
+    Op_PUSH = 1,
+    Op_PULL = 2
+};
+
+typedef std::array<char, hash_len> Hash;
+
+inline std::ostream& operator<<(std::ostream& os, const Hash& hash) {
+    for (char c : hash) {
+        os << c;
+    }
+    return os;
+}
+
+struct HashHasher {
+    std::size_t operator()(const Hash &hash) const noexcept {
+        std::size_t h = 0;
+
+        for(int i = 0; i < sizeof(std::size_t); i++) {
+            ((char*)&h)[i] = ((hash[2*i] <= '9' ? hash[2*i] - '0' : hash[2*i] - 'a' + 10) << 4) |
+                (hash[2*i+1] <= '9' ? hash[2*i+1] - '0' : hash[2*i+1] - 'a' + 10);
+        }
+
+        return h;
+    }
+};
+struct HashList {
+    std::vector<Hash> ordered;
+    std::unordered_set<Hash, HashHasher> seen;
+
+    bool insert(const Hash &hash) {
+        if (!seen.insert(hash).second)
+            return false;
+
+        ordered.push_back(hash);
+        return true;
+    }
+
+    bool contains(const Hash &hash) const {
+        return seen.find(hash) != seen.end();
+    }
+};
+/* A hash arriving over the network becomes a FILE PATH, so validating it is a
+ * security boundary rather than tidiness: 64 bytes containing '/' and '.' walk
+ * out of the object store and write anywhere the process can reach. Length
+ * alone was checked, which does not stop that.
+ */
+inline bool is_hex_hash(const char *str, std::size_t len) {
+    if(len != hash_len) {
+        return false;
+    }
+    for(std::size_t i = 0; i < len; i++) {
+        const char c = str[i];
+        if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+inline bool is_hex_hash(const Hash &hash) {
+    return is_hex_hash(hash.data(), hash_len);
+}
+
+inline void make_hash(Hash &out, const char *str) {
+    if(!is_hex_hash(str, std::strlen(str))) {
+        throw std::invalid_argument(
+            "Hash must be exactly 64 lowercase hex characters");
+    }
+
+    std::memcpy(out.data(), str, hash_len);
+}
+
+inline std::string branch_path(const std::string branch) {
+    return "refs/heads/" + branch;
+}
+/* objects/<ab>/<cd>/<60-hex>, for EVERY object kind.
+ *
+ * Chunks are not a separate namespace. The store used to keep them in packs
+ * with their own directory, and this file previously encoded that: a one-tier
+ * `objects/<ab>/<62>` for manifests and an `objects/chunks/...` subtree for
+ * chunk payloads. Neither path exists any more -- see ARCHITECTURE.md 3.3 --
+ * so every open failed and a pull transferred nothing.
+ *
+ * One function now serves both; `chunk_path` is kept only so call sites read
+ * the way the author intended.
+ */
+inline std::string hash_path(const Hash hash) {
+    std::string path = "objects/";
+    path.append(hash.data(), 2);
+    path.push_back('/');
+    path.append(hash.data() + 2, 2);
+    path.push_back('/');
+    path.append(hash.data() + 4, hash_len - 4);
+    return path;
+}
+inline std::string chunk_path(const Hash hash) {
+    return hash_path(hash);
+}
+
+inline bool has_hash(const Hash hash) {
+    std::filesystem::path file_path = hash_path(hash);
+    if(std::filesystem::exists(file_path)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+inline bool has_chunk(const Hash hash) {
+    std::filesystem::path file_path = chunk_path(hash);
+    if(std::filesystem::exists(file_path)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+inline bool send_all(int sock, const void* data, size_t len) {
+    const char* ptr = static_cast<const char*>(data);
+    while(len > 0) {
+        ssize_t n = send(sock, ptr, len, 0);
+        if(n < 0) {
+            if(errno == EINTR)
+                continue;
+            return false;
+        }
+        if(n == 0) {
+            return false;
+        }
+        ptr += n;
+        len -= n;
+    }
+    return true;
+}
+inline bool recv_all(int sock, void* data, size_t len) {
+    char* ptr = static_cast<char*>(data);
+    while(len > 0) {
+        ssize_t n = recv(sock, ptr, len, 0);
+        if(n < 0) {
+            if(errno == EINTR)
+                continue;
+            return false;
+        }
+        if(n == 0) {
+            return false;
+        }
+        ptr += n;
+        len -= n;
+    }
+    return true;
+}
+
+inline bool send_string(int sock, const std::string &str) {
+    uint32_t len = htonl(static_cast<uint32_t>(str.size()));
+
+    return send_all(sock, &len, sizeof(len)) &&
+           send_all(sock, str.data(), str.size());
+}
+inline bool recv_string(int sock, std::string &str) {
+    uint32_t net_len;
+    if(!recv_all(sock, &net_len, sizeof(net_len))) { return false; }
+    uint32_t len = ntohl(net_len);
+    str.resize(len);
+    return recv_all(sock, str.data(), len);
+}
+
+inline bool send_file(int sock, const std::filesystem::path& path) {
+    std::error_code ec;
+    auto file_size = std::filesystem::file_size(path, ec);
+    if(ec || file_size > UINT32_MAX) {
+        return false;
+    }
+
+    uint32_t len = static_cast<uint32_t>(file_size);
+    uint32_t net_len = htonl(len);
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    std::vector<char> data(len);
+    if(len > 0) {
+        file.read(data.data(), len);
+        if(!file) {
+            return false;
+        }
+    }
+
+    // [4 bytes][file data]
+    if(!send_all(sock, &net_len, sizeof(net_len))) {
+        return false;
+    }
+    if(len > 0 && !send_all(sock, data.data(), len)) {
+        return false;
+    }
+
+    return true;
+}
+inline bool recv_file(int sock, const std::filesystem::path& final_path) {
+    uint32_t net_len;
+    if(!recv_all(sock, &net_len, sizeof(net_len))) {
+        return false;
+    }
+    uint32_t len = ntohl(net_len);
+
+    // Temporary file in the same directory as the final file.
+    std::filesystem::path tmp_path = final_path;
+    tmp_path += ".tmp";
+
+    std::error_code ec;
+    std::filesystem::create_directories(tmp_path.parent_path(), ec);
+    if(ec) {
+        std::cerr << "failed to create directory: " << ec.message() << '\n';
+        return false;
+    }
+
+    std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
+    if(!file) {
+        return false;
+    }
+
+    std::vector<char> data(len);
+    if(len > 0) {
+        if(!recv_all(sock, data.data(), len)) {
+            file.close();
+            std::filesystem::remove(tmp_path);
+            return false;
+        }
+        file.write(data.data(), len);
+        if(!file) {
+            file.close();
+            std::filesystem::remove(tmp_path);
+            return false;
+        }
+    }
+
+    file.close();
+    if(!file) {
+        std::filesystem::remove(tmp_path);
+        return false;
+    }
+
+    // Atomic replacement/install.
+    std::filesystem::rename(tmp_path, final_path, ec);
+
+    if(ec) {
+        std::filesystem::remove(tmp_path);
+        return false;
+    }
+    return true;
+}
+
+/* Dependency Tree:
+ * branch   > commit
+ * commit   > checkpoint_manifest
+ *          > parents
+ * checkpoint_manifest  > header_object
+ *                      > tensor_manifests
+ * tensor_manifests > parents
+ *                  > base_row_permutation
+ *                  > base_col_permutation
+ *                  > chunks
+ */
+
+
+

@@ -328,6 +328,41 @@ Finally we run **zstd** (a standard compressor) at level 1 over the result. The 
 product is a **residual**: a compressed blob that, combined with the older
 checkpoint, reproduces the newer one exactly.
 
+### 4.6a When most differences fit in one byte
+
+Everything above was measured on **fp16**, and one of the two float formats we
+support behaves quite differently.
+
+`bf16` has 7 mantissa bits where fp16 has 10. Fewer mantissa bits means a
+coarser grid, so the *same* weight movement lands far fewer steps away: the
+median difference between consecutive checkpoints falls from **510 to 27**.
+Most differences now fit comfortably in a single byte.
+
+That makes a second encoding worth having. First **zigzag**: rewrite the signed
+difference so both signs are small, `-1 -> 1`, `+1 -> 2`, `-2 -> 3`. Without it
+a difference of `-1` is stored as 65535, which is not small at all. Then write
+one byte per weight — the value itself, or the marker `0xFF` if it doesn't fit,
+with the oversized values collected in a separate plane at the end.
+
+Two details matter more than they look:
+
+- **The oversized values go at the end, not inline.** Splicing them in after
+  each marker interrupts a run of small bytes and the compressor loses its
+  match across the break. Moving them out is worth 2.6 percentage points.
+- **The choice is made per chunk by counting, not by dtype.** A weight costs
+  1 byte when it fits and 3 when it doesn't, so the average is `3 - 2p` for a
+  fitting fraction `p` — which only beats storing 2 bytes when more than half
+  of them fit. Deciding by format instead would get bf16 wrong whenever the
+  base checkpoint is far away and the differences have grown.
+
+The gain is large: **60.9% -> 52.8%** on a bf16 model. On fp16 only 35% of
+differences fit in a byte, the encoding would need *more* than 2 bytes per
+weight, and the codec correctly falls back to plain byte shuffling.
+
+The lesson worth carrying: several ideas in 4.5 were rejected on fp16 and are
+*wrong* for bf16. Zigzag was removed from the codebase as a loser and is now
+essential. Any conclusion here is conditional on the mantissa width.
+
 ### 4.7 Chunks
 
 We don't do this a whole tensor at a time. Each tensor is cut into **chunks** —
@@ -399,6 +434,10 @@ about 9% more space and reads about 2× faster.
 
 ---
 
+> **Going deeper on the systems side?** `SYSTEMS_PRIMER.md` explains FUSE,
+> inodes, caching and memory from scratch; `FUSE.md` and `ALIGNMENT.md` then go
+> through those two modules function by function.
+
 ## 6. Giving the files back
 
 Two ways to get a checkpoint out.
@@ -406,11 +445,11 @@ Two ways to get a checkpoint out.
 **`checkout`** writes a real file to disk. It reads the stored header verbatim,
 then rebuilds each tensor chunk by chunk and streams it out.
 
-**The mount** (module 2, not yet built) is the more interesting one. The PS
-wants a **virtual filesystem**: a directory that *looks* like it contains
-`model.safetensors`, so that `torch.load_file("mount/model.safetensors")` just
-works — but where no such file exists on disk. When a program reads bytes from
-it, we reconstruct exactly those bytes on the spot.
+**The mount** is the more interesting one. The PS wants a **virtual
+filesystem**: a directory that *looks* like it contains `model.safetensors`, so
+that `torch.load_file("mount/model.safetensors")` just works — but where no such
+file exists on disk. When a program reads bytes from it, we reconstruct exactly
+those bytes on the spot.
 
 The usual tool for this is **FUSE** ("Filesystem in Userspace"), a Linux
 mechanism that lets an ordinary program answer filesystem requests. Your
@@ -418,6 +457,39 @@ program registers "when someone reads this file, call me", and the kernel does.
 
 The point is that a 3 GB checkpoint can be *used* without ever existing as 3 GB
 on disk.
+
+### 6.1 Two mistakes worth knowing about
+
+Both were found by actually mounting the thing and copying a file off it, which
+is worth doing early — neither showed up in the tests, because the test fixtures
+are small enough that neither condition arises.
+
+**The cache was remembering the wrong thing.** A cache is a dictionary, and what
+you look things up by (the *key*) decides whether it ever helps. The key was the
+range of rows a request asked for. But the kernel hands out 128 KB reads while
+chunks are 4 MB, so every request asked for a slightly different range, produced
+a brand-new key, missed, and decompressed the whole 4 MB chunk again to return
+3% of it. Reading a 177 MB file did **8.7 GB** of disk work.
+
+The fix is to key on the *chunk* — the thing that was actually decoded — so the
+first read of a chunk pays for it and the next thirty-one are slices of a hit.
+The rule generalises: **a cache key must describe the work you did, not the work
+you were asked for.**
+
+**Un-shuffling was written the obvious way, which is the slow way.** Undoing the
+byte shuffle means turning two separate byte planes back into interleaved
+values. In numpy that is naturally written as "reshape, transpose, copy" — and
+copying a transposed array leaves numpy nothing contiguous to work with, so it
+falls back to moving **one byte at a time**. It was 59% of the entire read path,
+four times the cost of the decompression it exists to support.
+
+Assigning one plane at a time instead — a contiguous read and a strided write,
+twice — is the same operation expressed so numpy can vectorise it. 6.2× faster,
+identical output.
+
+Together those two fixes took the mount from **11.1 s to 0.86 s** for a 177 MB
+checkpoint. Neither was a clever algorithm; both were a matter of measuring
+where the time actually went rather than assuming.
 
 ---
 
