@@ -68,7 +68,7 @@ inline bool is_hex_hash(const char *str, std::size_t len) {
     }
     for(std::size_t i = 0; i < len; i++) {
         const char c = str[i];
-        if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+        if(!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
             return false;
         }
     }
@@ -80,8 +80,8 @@ inline bool is_hex_hash(const Hash &hash) {
 
 inline void make_hash(Hash &out, const char *str) {
     if(!is_hex_hash(str, std::strlen(str))) {
-        throw std::invalid_argument(
-            "Hash must be exactly 64 lowercase hex characters");
+        std::cerr << str << std::endl;
+        throw std::invalid_argument("Hash must be exactly 64 lowercase hex characters");
     }
 
     std::memcpy(out.data(), str, hash_len);
@@ -90,17 +90,10 @@ inline void make_hash(Hash &out, const char *str) {
 inline std::string branch_path(const std::string branch) {
     return "refs/heads/" + branch;
 }
-/* objects/<ab>/<cd>/<60-hex>, for EVERY object kind.
- *
- * Chunks are not a separate namespace. The store used to keep them in packs
- * with their own directory, and this file previously encoded that: a one-tier
- * `objects/<ab>/<62>` for manifests and an `objects/chunks/...` subtree for
- * chunk payloads. Neither path exists any more -- see ARCHITECTURE.md 3.3 --
- * so every open failed and a pull transferred nothing.
- *
- * One function now serves both; `chunk_path` is kept only so call sites read
- * the way the author intended.
- */
+inline std::string head_path() {
+    return "HEAD";
+}
+// objects/<ab>/<cd>/<60-hex>, for EVERY object kind.
 inline std::string hash_path(const Hash hash) {
     std::string path = "objects/";
     path.append(hash.data(), 2);
@@ -110,20 +103,9 @@ inline std::string hash_path(const Hash hash) {
     path.append(hash.data() + 4, hash_len - 4);
     return path;
 }
-inline std::string chunk_path(const Hash hash) {
-    return hash_path(hash);
-}
 
 inline bool has_hash(const Hash hash) {
     std::filesystem::path file_path = hash_path(hash);
-    if(std::filesystem::exists(file_path)) {
-        return true;
-    } else {
-        return false;
-    }
-}
-inline bool has_chunk(const Hash hash) {
-    std::filesystem::path file_path = chunk_path(hash);
     if(std::filesystem::exists(file_path)) {
         return true;
     } else {

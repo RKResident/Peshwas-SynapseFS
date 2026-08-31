@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if(std::string(argv[1]) == "serve") {
-        if(argc != 3) {
+        if(argc != 3 && argc != 4) {
             std::cout << "Improper usage" << std::endl;
             return 1;
         }
@@ -67,11 +67,28 @@ int main(int argc, char** argv) {
             if(port < 0 || port > UINT16_MAX) {
                 throw std::exception();
             }
-        } catch (const std::exception &e) {
+        } catch(const std::exception &e) {
             std::cout << "Invalid port" << std::endl;
             return 1;
         }
-        return serve(port);
+        bool ro = false;
+        if(argc == 4) {
+            std::string ro_arg = argv[3];
+            if(ro_arg.substr(0, 3) == "ro=" && ro_arg.size() == 4) {
+                if(ro_arg[3] == '0') {
+                    ro = false;
+                } else if(ro_arg[3] == '1') {
+                    ro = true;
+                } else {
+                    std::cerr << "Invalid read-only flag" << std::endl;
+                    return 1;
+                }
+            } else {
+                std::cerr << "Invalid read-only flag" << std::endl;
+                return 1;
+            }
+        }
+        return serve(port, ro);
     } else if(std::string(argv[1]) == "push"
             || std::string(argv[1]) == "pull") {
         if(argc != 5) {

@@ -12,7 +12,7 @@
 #include "pull.cpp"
 #include "network_common.hpp"
 
-int serve(uint16_t port) {
+int serve(uint16_t port, bool ro) {
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if(server < 0) {
         perror("socket");
@@ -68,7 +68,11 @@ int serve(uint16_t port) {
         switch(static_cast<Operation>(op)) {
             case Operation::Op_PUSH:
                 // handle_push(client, branch);
-                pull(client, client_branch);
+                if(!ro) {
+                    pull(client, client_branch);
+                } else {
+                    close(client);
+                }
                 break;
             case Operation::Op_PULL:
                 // handle_pull(client, branch);

@@ -13,7 +13,7 @@
 #include "network_common.hpp"
 
 
-int tensor_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &req_chunks) {
+int tensor_get_objects(const Hash &hash, HashList &req_hash_objects) {
     if(req_hash_objects.contains(hash)) {return 0;}
     std::string fp = hash_path(hash);
     std::ifstream f(fp, std::ios::binary);
@@ -56,7 +56,7 @@ int tensor_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
         } else {
             make_hash(parent_hash, parent.c_str());
         }
-        int rv = tensor_get_objects(parent_hash, req_hash_objects, req_chunks);
+        int rv = tensor_get_objects(parent_hash, req_hash_objects);
         if(rv) {
             return rv;
         }
@@ -71,7 +71,7 @@ int tensor_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
         } else {
             make_hash(row_perm_hash, row_perm.c_str());
         }
-        req_chunks.insert(row_perm_hash);
+        req_hash_objects.insert(row_perm_hash);
     }
 
     if(!json["base_col_permutation"].is_null()) {
@@ -83,7 +83,7 @@ int tensor_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
         } else {
             make_hash(col_perm_hash, col_perm.c_str());
         }
-        req_chunks.insert(col_perm_hash);
+        req_hash_objects.insert(col_perm_hash);
     }
 
     for(const auto &chunk : json["chunks"]) {
@@ -98,7 +98,7 @@ int tensor_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
         }
         Hash chunk_obj_hash;
         make_hash(chunk_obj_hash, chunk_obj_str.c_str());
-        req_chunks.insert(chunk_obj_hash);
+        req_hash_objects.insert(chunk_obj_hash);
     }
 
     req_hash_objects.insert(hash);
@@ -106,7 +106,7 @@ int tensor_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
     return 0;
 }
 
-int checkpoint_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &req_chunks) {
+int checkpoint_get_objects(const Hash &hash, HashList &req_hash_objects) {
     if(req_hash_objects.contains(hash)) {return 0;}
     std::string fp = hash_path(hash);
     std::ifstream f(fp, std::ios::binary);
@@ -151,7 +151,7 @@ int checkpoint_get_objects(const Hash &hash, HashList &req_hash_objects, HashLis
             && json["topology_config_hash"].is_string()) {
         const std::string config = json["topology_config_hash"];
         if(config.size() != hash_len) {
-            std::cerr << "invalid topology config hash" << std::endl;
+            std::cerr << config << "invalid topology config hash" << std::endl;
             return 1;
         }
         Hash config_hash;
@@ -171,7 +171,7 @@ int checkpoint_get_objects(const Hash &hash, HashList &req_hash_objects, HashLis
         }
         Hash tensor_hash;
         make_hash(tensor_hash, tensor_str.c_str());
-        int rv = tensor_get_objects(tensor_hash, req_hash_objects, req_chunks);
+        int rv = tensor_get_objects(tensor_hash, req_hash_objects);
         if(rv) {
             return rv;
         }
@@ -181,7 +181,7 @@ int checkpoint_get_objects(const Hash &hash, HashList &req_hash_objects, HashLis
     return 0;
 }
 
-int commit_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &req_chunks) {
+int commit_get_objects(const Hash &hash, HashList &req_hash_objects) {
     if(req_hash_objects.contains(hash)) {return 0;}
     std::string fp = hash_path(hash);
     std::ifstream f(fp, std::ios::binary);
@@ -215,7 +215,7 @@ int commit_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
     } else {
         make_hash(checkpoint_hash, checkpoint.c_str());
     }
-    int cgo_rv = checkpoint_get_objects(checkpoint_hash, req_hash_objects, req_chunks);
+    int cgo_rv = checkpoint_get_objects(checkpoint_hash, req_hash_objects);
     if(cgo_rv) {
         return cgo_rv;
     }
@@ -231,7 +231,7 @@ int commit_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
         }
         Hash ph;
         make_hash(ph, parent.c_str());
-        int cgo_rv = commit_get_objects(ph, req_hash_objects, req_chunks);
+        int cgo_rv = commit_get_objects(ph, req_hash_objects);
         if(cgo_rv) {
             return cgo_rv;
         }
@@ -241,7 +241,7 @@ int commit_get_objects(const Hash &hash, HashList &req_hash_objects, HashList &r
     return 0;
 }
 
-int branch_get_objects(const std::string &branch, HashList &req_hash_objects, HashList &req_chunks) {
+int branch_get_objects(const std::string &branch, HashList &req_hash_objects) {
     std::string fp = branch_path(branch);
     std::ifstream f(fp, std::ios::binary);
     if(!f.is_open()) {
@@ -256,20 +256,18 @@ int branch_get_objects(const std::string &branch, HashList &req_hash_objects, Ha
         return 1;
     }
 
-    int rv = commit_get_objects(commit_hash, req_hash_objects, req_chunks);
+    int rv = commit_get_objects(commit_hash, req_hash_objects);
     if(rv) { return rv; }
     return 0;
 }
 
 int push(const int client, const std::string branch) {
     HashList req_hash_objects;
-    HashList req_chunks;
-    if(branch_get_objects(branch, req_hash_objects, req_chunks)) {
+    if(branch_get_objects(branch, req_hash_objects)) {
         std::cerr << "could not resolve branch '" << branch << "'" << std::endl;
-        // The peer is waiting on two length-prefixed lists; send empty ones so
+        // The peer is waiting on a length-prefixed lists; send an empty one so
         // it fails cleanly instead of blocking on a socket that never speaks.
         uint32_t zero = htonl(0);
-        send_all(client, &zero, sizeof(zero));
         send_all(client, &zero, sizeof(zero));
         return 1;
     }
@@ -280,23 +278,12 @@ int push(const int client, const std::string branch) {
     if(!send_all(client, req_hash_objects.ordered.data(), req_hash_objects.ordered.size() * hash_len)) { return 1; }
     std::cout << "sent required hash objects (" << req_hash_objects.ordered.size() << " records)" << std::endl;
 
-    std::cout << "sending required chunks (" << req_chunks.ordered.size() << " records)" << std::endl;
-    uint32_t rc_len = htonl(req_chunks.ordered.size());
-    if(!send_all(client, &rc_len, sizeof(rc_len))) { return 1; }
-    if(!send_all(client, req_chunks.ordered.data(), req_chunks.ordered.size() * hash_len)) { return 1; }
-    std::cout << "sent required chunks (" << req_chunks.ordered.size() << " records)" << std::endl;
-
     rho_len = ntohl(rho_len);
-    rc_len = ntohl(rc_len);
 
     std::vector<char> hash_exists(rho_len);
-    std::vector<char> chunk_exists(rc_len);
 
     if(!recv_all(client, hash_exists.data(), rho_len)) { return 1; }
     std::cout << "received hash status" << std::endl;
-
-    if(!recv_all(client, chunk_exists.data(), rc_len)) { return 1; }
-    std::cout << "received chunk status" << std::endl;
 
     for(uint32_t i = 0; i < rho_len; i++) {
         if(hash_exists[i]) {
@@ -307,17 +294,6 @@ int push(const int client, const std::string branch) {
         if(!send_file(client, hash_path(req_hash_objects.ordered[i]))) { return 1; }
         std::cout << "sent hash " << req_hash_objects.ordered[i] << std::endl;
     }
-    for(uint32_t i = 0; i < rc_len; i++) {
-        if(chunk_exists[i]) {
-            std::cout << "skipping chunk " << req_chunks.ordered[i] << ": already exists" << std::endl;
-            continue;
-        }
-        std::cout << "sending chunk " << req_chunks.ordered[i] << "..." << std::endl;
-        if(!send_file(client, chunk_path(req_chunks.ordered[i]))) { return 1; }
-        std::cout << "sent chunk " << req_chunks.ordered[i] << std::endl;
-    }
-
-
 
 
     close(client);
