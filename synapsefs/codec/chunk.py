@@ -135,7 +135,7 @@ SINT = "sint"    # two's complement.
 _DTYPES: dict[str, Tuple[int, str]] = {
     "F16": (2, FLOAT),
     "BF16": (2, FLOAT),
-    "F32": (4, FLOAT),
+    "F32": (4, FLOAT), #redundant?
     "I64": (8, SINT),
 }
 

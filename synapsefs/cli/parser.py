@@ -24,6 +24,9 @@ from synapsefs.cli.commands import checkout as checkout_cmd
 from synapsefs.cli.commands import restore as restore_cmd
 from synapsefs.cli.commands import verify as verify_cmd
 from synapsefs.cli.commands import merge as merge_cmd
+from synapsefs.cli.commands import pull as pull_cmd
+from synapsefs.cli.commands import push as push_cmd
+from synapsefs.cli.commands import serve as serve_cmd
 
 # Every module listed here must expose add_subparser(subparsers, global_parser).
 # Add verify, push, pull, serve, merge, mount and unmount here as each one
@@ -31,7 +34,7 @@ from synapsefs.cli.commands import merge as merge_cmd
 # lifecycle-first rather than alphabetically.
 _COMMAND_MODULES = [
     init_cmd, commit_cmd, log_cmd, branch_cmd, checkout_cmd, restore_cmd,
-    verify_cmd, merge_cmd, mount_cmd, unmount_cmd
+    verify_cmd, merge_cmd, mount_cmd, unmount_cmd, pull_cmd, push_cmd, serve_cmd
 ]
 
 

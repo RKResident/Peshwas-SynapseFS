@@ -21,6 +21,9 @@ tools/checkpoints
 tools/data
 tools/benchmark
 synapsefs/networking/test/
+mnist_repo/
+examples/mnist_repo/
+examples/.*
 
 # --- Benchmark output --------------------------------------------------------
 bench-results/

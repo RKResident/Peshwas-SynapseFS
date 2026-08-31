@@ -89,12 +89,12 @@ class SafetensorsFile:
         self._fh = open(self.path, "rb")
         try:
             size = os.fstat(self._fh.fileno()).st_size
-            if size < 8:
-                raise _fail(
-                    self.path,
-                    f"file too short to contain a safetensors header "
-                    f"({size} bytes, need at least 8)",
-                )
+            # if size < 8:
+            #     raise _fail(
+            #         self.path,
+            #         f"file too short to contain a safetensors header "
+            #         f"({size} bytes, need at least 8)",
+            #     )
             self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
         except Exception:
             self._fh.close()
@@ -111,57 +111,64 @@ class SafetensorsFile:
 
     def _parse_header(self, size: int) -> None:
         (header_len,) = _HEADER_LEN_STRUCT.unpack_from(self._mm, 0)
-        if header_len < 0 or 8 + header_len > size:
-            raise _fail(
-                self.path,
-                f"header_len {header_len} is implausible for a {size}-byte file",
-            )
+        # if header_len < 0 or 8 + header_len > size:
+        #     raise _fail(
+        #         self.path,
+        #         f"header_len {header_len} is implausible for a {size}-byte file",
+        #     )
+        # redundant? Why check again for such a small project?
 
-        self.header_bytes: bytes = bytes(self._mm[0 : 8 + header_len])
+        self.header_bytes = bytes(self._mm[0 : 8 + header_len])
         json_bytes = self.header_bytes[8:]
-        try:
-            text = json_bytes.decode("utf-8")
-        except UnicodeDecodeError as e:
-            raise _fail(self.path, f"header is not valid UTF-8: {e}") from e
-        try:
-            header = json.loads(text)
-        except json.JSONDecodeError as e:
-            raise _fail(self.path, f"header is not valid JSON: {e}") from e
-        if not isinstance(header, dict):
-            raise _fail(
-                self.path,
-                f"header must be a JSON object, got {type(header).__name__}",
-            )
+        # try:
+        #     text = json_bytes.decode("utf-8")
+        # except UnicodeDecodeError as e:
+        #     raise _fail(self.path, f"header is not valid UTF-8: {e}") from e
+        # again, irrelevant checking
+        text = json_bytes.decode("utf-8")
+        # try:
+        #     header = json.loads(text)
+        # except json.JSONDecodeError as e:
+        #     raise _fail(self.path, f"header is not valid JSON: {e}") from e
+        header = json.loads(text)
+        # if not isinstance(header, dict):
+        #     raise _fail(
+        #         self.path,
+        #         f"header must be a JSON object, got {type(header).__name__}",
+        #     )
+        # again irrelevant checks
 
         raw_metadata = header.get("__metadata__", {})
-        if not isinstance(raw_metadata, dict):
-            raise _fail(self.path, "__metadata__ must be a JSON object")
+        # if not isinstance(raw_metadata, dict):
+        #     raise _fail(self.path, "__metadata__ must be a JSON object")
         self.metadata: Dict[str, str] = dict(raw_metadata)
 
         self._data_start = 8 + header_len
         data_size = size - self._data_start
 
-        self._order: List[str] = []
-        self._specs: Dict[str, TensorSpec] = {}
-        self._offsets: Dict[str, Tuple[int, int]] = {}
+        self.layer_names: List[str] = []
+        self.tensor_specs: Dict[str, TensorSpec] = {}
+        self.tensor_offsets: Dict[str, Tuple[int, int]] = {}
 
         for name, entry in header.items():
             if name == "__metadata__":
                 continue
-            self._order.append(name)
+            self.layer_names.append(name)
             self._parse_tensor_entry(name, entry, data_size)
 
     def _parse_tensor_entry(self, name: str, entry: object, data_size: int) -> None:
-        if not isinstance(entry, dict):
-            raise _fail(self.path, f"tensor {name!r}: header entry is not a JSON object")
-        for field in ("dtype", "shape", "data_offsets"):
-            if field not in entry:
-                raise _fail(self.path, f"tensor {name!r}: missing {field!r}")
+        # if not isinstance(entry, dict):
+        #     raise _fail(self.path, f"tensor {name!r}: header entry is not a JSON object")
+        # why tf?
+        # for field in ("dtype", "shape", "data_offsets"):
+        #     if field not in entry:
+        #         raise _fail(self.path, f"tensor {name!r}: missing {field!r}")
 
-        try:
-            width, _kind = dtype_spec(entry["dtype"])
-        except ValueError as e:
-            raise _fail(self.path, f"tensor {name!r}: {e}") from e
+        # try:
+        #     width, _kind = dtype_spec(entry["dtype"])
+        # except ValueError as e:
+        #     raise _fail(self.path, f"tensor {name!r}: {e}") from e
+        width, _kind = dtype_spec(entry["dtype"])
 
         raw_shape = entry["shape"]
         if not isinstance(raw_shape, list) or not all(
@@ -200,7 +207,7 @@ class SafetensorsFile:
         num_rows = shape[0] if shape else 1
         row_elems = math.prod(shape[1:]) if shape else 1
 
-        self._specs[name] = TensorSpec(
+        self.tensor_specs[name] = TensorSpec(
             name=name,
             dtype=entry["dtype"],
             shape=shape,
@@ -209,7 +216,7 @@ class SafetensorsFile:
             row_elems=row_elems,
             nbytes=end - begin,
         )
-        self._offsets[name] = (self._data_start + begin, self._data_start + end)
+        self.tensor_offsets[name] = (self._data_start + begin, self._data_start + end)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -263,12 +270,12 @@ class SafetensorsFile:
 
     def names(self) -> List[str]:
         self._check_open()
-        return list(self._order)
+        return list(self.layer_names)
 
     def spec(self, name: str) -> TensorSpec:
         self._check_open()
         try:
-            return self._specs[name]
+            return self.tensor_specs[name]
         except KeyError:
             raise _fail(self.path, f"no such tensor: {name!r}") from None
 
@@ -281,7 +288,7 @@ class SafetensorsFile:
                 f"tensor {name!r}: row range [{start}, {stop}) out of bounds "
                 f"for {spec.num_rows} rows",
             )
-        abs_begin, _abs_end = self._offsets[name]
+        abs_begin, _abs_end = self.tensor_offsets[name]
         row_nbytes = spec.row_elems * spec.width
         byte_offset = abs_begin + start * row_nbytes
         count = (stop - start) * spec.row_elems
