@@ -174,38 +174,14 @@ def _manifest_dict(
 ) -> dict:
     return {
         "name": spec.name,
-        # Verbatim safetensors dtype name (e.g. "BF16"), matching every other
-        # dtype string in this codebase. FORMAT.md section 7's own example
-        # shows lowercase "bf16", which disagrees with the rest of the spec
-        # (section 8's key-kind table, chunk.py's `_DTYPES`, and
-        # safetensors_io's `TensorSpec.dtype`, all uppercase) -- a doc
-        # discrepancy, not something to paper over here.
+        # safetensors dtype name (e.g. "BF16")
         "dtype": spec.dtype,
         "shape": list(spec.shape),
         # BLAKE3 of this tensor's fully reconstructed bytes, in this
-        # checkpoint's own row order -- independent of the base, the
-        # permutations, the chunk boundaries and the encoding.
-        #
-        # It exists because **the manifest hash is not a content identity.**
-        # Two manifests with the same hash certainly hold the same content;
-        # the converse is false, and merge depends on the converse: two
-        # branches can hold byte-identical weights whose manifests differ
-        # because they were aligned against different bases. Comparing
-        # manifest hashes would report a conflict on a tensor nobody touched.
-        #
-        # It is also the only check that catches a permutation composed in the
-        # wrong order across a base chain -- both orderings are valid
-        # bijections of the correct length, so no structural invariant sees it.
+        # checkpoint's own row order
         "content_hash": content_hash,
         # The tensor-manifest this one was diffed against, or null if this
         # tensor was stored in full.
-        #
-        # The relationship is an "if and only if": null **iff** no chunk uses a
-        # delta encoding. A delta chunk with no base is unresolvable; a base
-        # with no delta chunk anywhere is a pointer to nothing -- it makes
-        # reconstruction walk into a manifest that contributes zero bytes, and
-        # forces GC to retain that whole subtree to satisfy a link nobody
-        # reads. The caller enforces the second direction (see `any_delta`).
         "base_tensor_manifest": base_manifest_hash,
         # Hashes of the stored permutation objects, or null for identity.
         # A residual is unreadable without these: the reconstructor has to

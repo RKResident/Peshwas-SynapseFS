@@ -35,8 +35,8 @@ __all__ = [
     "EncodedChunk",
     "encode_chunk",
     "decode_chunk",
-    "to_monotone_key",
-    "from_monotone_key",
+    # "to_monotone_key",
+    # "from_monotone_key",
     "zigzag",
     "unzigzag",
     "dtype_spec",
@@ -47,14 +47,14 @@ __all__ = [
     "unshuffle_to_array",
     "RAW",
     "RAW_ZSTD",
-    "DELTA",
+    # "DELTA",
     "RAW_SHUFFLE_ZSTD",
     "DELTA_SHUFFLE",
 ]
 
 RAW = "raw"
 RAW_ZSTD = "raw-zstd"
-DELTA = "delta-zigzag-zstd"
+# DELTA = "delta-zigzag-zstd"
 
 # Current encodings. The shuffle is part of the *stream definition* here, not a
 # compressor setting (see `shuffle`), so these carry their own names rather
@@ -81,9 +81,13 @@ DELTA_ZIGZAG_ESCAPE = "delta-zigzag-escape-zstd"
 #: that happens inside the stream rather than over it.
 _SHUFFLED = frozenset({RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE})
 
-_ZSTD_FRAMED = frozenset({RAW_ZSTD, DELTA, RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE,
+# _ZSTD_FRAMED = frozenset({RAW_ZSTD, DELTA, RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE,
+#                           DELTA_ZIGZAG_ESCAPE})
+# _DELTA_ENCODINGS = frozenset({DELTA, DELTA_SHUFFLE, DELTA_ZIGZAG_ESCAPE})
+
+_ZSTD_FRAMED = frozenset({RAW_ZSTD, RAW_SHUFFLE_ZSTD, DELTA_SHUFFLE,
                           DELTA_ZIGZAG_ESCAPE})
-_DELTA_ENCODINGS = frozenset({DELTA, DELTA_SHUFFLE, DELTA_ZIGZAG_ESCAPE})
+_DELTA_ENCODINGS = frozenset({DELTA_SHUFFLE, DELTA_ZIGZAG_ESCAPE})
 
 
 def is_delta(encoding: str) -> bool:
@@ -169,56 +173,50 @@ def dtype_spec(dtype: str) -> Tuple[int, str]:
 # form is branchless and allocates two.
 
 
-def _mask_forward(bits: np.ndarray, kind: str, msb, zero, shift) -> np.ndarray:
-    if kind == SINT:
-        return msb
-    # FLOAT: sign set -> all-ones (a full complement); sign clear -> just the
-    # sign bit. `zero - (bits >> shift)` is 0 or all-ones without a compare.
-    return (zero - (bits >> shift)) | msb
+# def _mask_forward(bits: np.ndarray, kind: str, msb, zero, shift) -> np.ndarray:
+#     if kind == SINT:
+#         return msb
+#     # FLOAT: sign set -> all-ones (a full complement); sign clear -> just the
+#     # sign bit. `zero - (bits >> shift)` is 0 or all-ones without a compare.
+#     return (zero - (bits >> shift)) | msb
 
 
-def _mask_inverse(key: np.ndarray, kind: str, msb, one, zero, shift) -> np.ndarray:
-    if kind == SINT:
-        return msb
-    # A key with its top bit *set* came from a non-negative float, so it needs
-    # only the sign bit flipped back; a key with it clear needs the full
-    # complement. That is the forward test inverted, hence the `^ one`.
-    return (zero - ((key >> shift) ^ one)) | msb
+# def _mask_inverse(key: np.ndarray, kind: str, msb, one, zero, shift) -> np.ndarray:
+#     if kind == SINT:
+#         return msb
+#     # A key with its top bit *set* came from a non-negative float, so it needs
+#     # only the sign bit flipped back; a key with it clear needs the full
+#     # complement. That is the forward test inverted, hence the `^ one`.
+#     return (zero - ((key >> shift) ^ one)) | msb
+
+#
+# def to_monotone_key(bits: np.ndarray, kind: str) -> np.ndarray:
+#     """Map raw float bits to an integer that sorts in the same order as the float.
+#
+#     **No longer used by the codec.** Retained for two consumers: decoding the
+#     legacy `delta-zigzag-zstd` encoding, and `materialize.compare_sources`,
+#     which uses the integer distance between two keys as a ULP distance -- the
+#     scale-free way to say "these differ by one representable step".
+#
+#     Why it left the encode path: floats are stored sign-magnitude, so negative
+#     bit patterns run backwards, and this map (`bits ^ 0x8000` when positive,
+#     `~bits` when negative) makes integer order match numeric order. That
+#     matters for the 3-5%% of weights that cross zero between checkpoints. But a
+#     plain modular subtraction of raw bits is *also* exactly reversible, and
+#     measured across all adjacent pairs the key is worth only +0.07pp -- while
+#     costing 0.26/0.47/0.66pp at gaps 2/3/4, which is what the star topology
+#     actually produces. Weighted, dropping it wins ~0.22pp and removes the
+#     FLOAT/SINT distinction from the storage path entirely.
+#     """
+#     zero, _one, msb, shift = _consts(bits.dtype.itemsize)
+#     return bits ^ _mask_forward(bits, kind, msb, zero, shift)
 
 
-def _consts(width: int):
-    u = _UINT_OF[width]
-    # 0, 1, msb, num_bits-1,
-    return u(0), u(1), u(1 << (width * 8 - 1)), u(width * 8 - 1)
-
-
-def to_monotone_key(bits: np.ndarray, kind: str) -> np.ndarray:
-    """Map raw float bits to an integer that sorts in the same order as the float.
-
-    **No longer used by the codec.** Retained for two consumers: decoding the
-    legacy `delta-zigzag-zstd` encoding, and `materialize.compare_sources`,
-    which uses the integer distance between two keys as a ULP distance -- the
-    scale-free way to say "these differ by one representable step".
-
-    Why it left the encode path: floats are stored sign-magnitude, so negative
-    bit patterns run backwards, and this map (`bits ^ 0x8000` when positive,
-    `~bits` when negative) makes integer order match numeric order. That
-    matters for the 3-5%% of weights that cross zero between checkpoints. But a
-    plain modular subtraction of raw bits is *also* exactly reversible, and
-    measured across all adjacent pairs the key is worth only +0.07pp -- while
-    costing 0.26/0.47/0.66pp at gaps 2/3/4, which is what the star topology
-    actually produces. Weighted, dropping it wins ~0.22pp and removes the
-    FLOAT/SINT distinction from the storage path entirely.
-    """
-    zero, _one, msb, shift = _consts(bits.dtype.itemsize)
-    return bits ^ _mask_forward(bits, kind, msb, zero, shift)
-
-
-def from_monotone_key(key: np.ndarray, kind: str) -> np.ndarray:
-    """Exact inverse of `to_monotone_key`. Pinned by an exhaustive test over
-    every 8- and 16-bit pattern, for all three key kinds."""
-    zero, one, msb, shift = _consts(key.dtype.itemsize)
-    return key ^ _mask_inverse(key, kind, msb, one, zero, shift)
+# def from_monotone_key(key: np.ndarray, kind: str) -> np.ndarray:
+#     """Exact inverse of `to_monotone_key`. Pinned by an exhaustive test over
+#     every 8- and 16-bit pattern, for all three key kinds."""
+#     zero, one, msb, shift = _consts(key.dtype.itemsize)
+#     return key ^ _mask_inverse(key, kind, msb, one, zero, shift)
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +243,11 @@ def from_monotone_key(key: np.ndarray, kind: str) -> np.ndarray:
 # against a stream that never inflates.
 
 
+def _consts(width: int):
+    u = _UINT_OF[width]
+    # 0, 1, msb, num_bits-1,
+    return u(0), u(1), u(1 << (width * 8 - 1)), u(width * 8 - 1)
+
 def zigzag(delta: np.ndarray) -> np.ndarray:
     """Interleave a two's-complement delta into an unsigned value so that
     small-magnitude deltas of either sign become small unsigned integers --
@@ -267,9 +270,10 @@ def unzigzag(zz: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------
 
 
+# Deprecated: No more packfiles
 @dataclass(frozen=True)
 class EncodedChunk:
-    """One encoded chunk, ready for the pack writer.
+    """One encoded chunk, ready for fianl storage
 
     Frozen and named rather than a bare tuple because the pack writer, the
     manifest builder and the `commit --json` counters each want a different
@@ -349,11 +353,11 @@ def _as_bits(arr: np.ndarray, width: int, role: str) -> np.ndarray:
     can never raise on a non-divisible length either.
     """
     a = np.ascontiguousarray(arr)
-    if a.dtype.itemsize != width:
-        raise ValueError(
-            f"{role} chunk has {a.dtype.itemsize}-byte elements ({a.dtype}) but "
-            f"the declared dtype needs {width}-byte elements"
-        )
+    # if a.dtype.itemsize != width:
+    #     raise ValueError(
+    #         f"{role} chunk has {a.dtype.itemsize}-byte elements ({a.dtype}) but "
+    #         f"the declared dtype needs {width}-byte elements"
+    #     )
     return a.view(_UINT_OF[width]).reshape(-1)
 
 
@@ -652,7 +656,7 @@ def plain_stream(
         return decompressor.decompress(payload)
     raise ValueError(
         f"unknown chunk encoding {encoding!r}; expected one of "
-        f"{RAW!r}, {RAW_ZSTD!r}, {DELTA!r}, {RAW_SHUFFLE_ZSTD!r}, "
+        f"{RAW!r}, {RAW_ZSTD!r}, {RAW_SHUFFLE_ZSTD!r}, "
         f"{DELTA_SHUFFLE!r}, {DELTA_ZIGZAG_ESCAPE!r}"
     )
 
@@ -691,9 +695,9 @@ def decode_chunk(
 
     if encoding in (RAW, RAW_ZSTD, RAW_SHUFFLE_ZSTD):
         return values if values is not None else np.frombuffer(stream, dtype=unsigned)
-
-    if base is None:
-        raise ValueError(f"{DELTA} chunk cannot be decoded without a base chunk")
+    #
+    # if base is None:
+    #     raise ValueError(f"{DELTA} chunk cannot be decoded without a base chunk")
     b_bits = _as_bits(base, width, "base")
 
     if encoding == DELTA_ZIGZAG_ESCAPE:
@@ -711,32 +715,10 @@ def decode_chunk(
             f"residual has {residual.size} elements but base chunk has {b_bits.size}"
         )
 
-    if encoding == DELTA:
-        # Legacy: this encoding's residual is a zigzag over *monotone keys*,
-        # so it has to be undone in that space.
-        return from_monotone_key(
-            to_monotone_key(b_bits, kind) + unzigzag(residual), kind
-        )
+    # if encoding == DELTA:
+    #     # Legacy: this encoding's residual is a zigzag over *monotone keys*,
+    #     # so it has to be undone in that space.
+    #     return from_monotone_key(
+    #         to_monotone_key(b_bits, kind) + unzigzag(residual), kind
+    #     )
     return (b_bits + residual).astype(unsigned, copy=False)
-
-#
-if __name__ == "__main__":
-    import numpy as np
-
-    bits = np.array([
-        0x0000,  # +0
-        0x3C00,  # +1.0
-        0x4000,  # +2.0
-        0x8000,  # -0
-        0xBC00,  # -1.0
-        0xC000,  # -2.0
-    ], dtype=np.uint16)
-
-    zero, one, msb, shift = _consts(2)
-
-    print("zero:", zero)
-    print("one :", one)
-    print("msb :", hex(int(msb)))
-    print("shift:", shift)
-
-    print(_mask_forward(bits, 'F16', msb, zero, shift))

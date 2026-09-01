@@ -292,7 +292,7 @@ class SafetensorsFile:
 
     def gather_rows(self, name: str, indices: Sequence[int]) -> np.ndarray:
         self._check_open()
-        spec = self.spec(name)
+        # spec = self.spec(name)
         idx = np.asarray(indices, dtype=np.intp)
         # if idx.size and (bool((idx < 0).any()) or bool((idx >= spec.num_rows).any())):
         #     raise _fail(
