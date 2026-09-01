@@ -58,7 +58,7 @@ Everything else follows from defending that guarantee cheaply:
 
 | PS module | grade | state |
 |---|---|---|
-| 1 Alignment & compression | 25% | codec done; aligner **wired in** (§8); scaling measured to n=10,000 at 100% recovery (§4.6.3) |
+| 1 Alignment & compression | 25% | codec done; aligner **wired in** (§8); scaling measured to n=10,000 at 100% recovery (§4.6.3); per-tensor adaptive anchoring behind `--anchor-policy` (§4.3.2) |
 | 2 Filesystem (FUSE) | 25% | done; runs live — mounts, lists, and reads back byte-identical for full and residual commits at 206 MiB/s (§4.4.1). `forget()` and the `(parent, name)` inode index are in |
 | 3 Cryptographic integrity | 20% | done (tiers to be re-based on §4.5.2) |
 | 4 Networking & CLI | 15% | CLI complete incl. `merge`; `push`/`pull`/`serve` merged in |
@@ -851,6 +851,10 @@ not alignable against the anchor, the anchor is a *different model* (a diverged
 branch), so this commit is stored full and becomes the branch's own hub. See
 `UNUSABLE_ANCHOR_FRACTION` in `cli/commands/commit.py`.
 
+Everything above describes `--anchor-policy flat`, still the default. §4.3.2
+covers the per-tensor alternative, which changes *when* hubs are created but
+leaves the star-vs-chain reasoning here intact.
+
 #### 4.3.1 Considered and rejected: bidirectional prediction (B-frames)
 
 In video terms the star is I-frames and P-frames, and the missing third kind is
@@ -909,6 +913,82 @@ rather than baked in at commit time.
 
 Reproduce with `tools/experiments/bframes.py`.
 
+#### 4.3.2 Per-tensor adaptive anchoring (`--anchor-policy adaptive`)
+
+The flat rule makes **one** decision for the whole checkpoint: full every
+`REBASE_INTERVAL`-th commit, residual otherwise. That is wrong in both
+directions at once. A frozen layer gets a fresh full copy it did not need; a
+fast-drifting layer keeps diffing against an anchor that went stale two commits
+ago and stores near-raw bytes every time.
+
+`--anchor-policy adaptive` moves the decision to the tensor. **No format change
+was required**: `base_tensor_manifest` is a field of the *tensor*-manifest, not
+the commit, and `CommitCheckpoint._rows_from_manifest` already recursed through
+it to arbitrary depth. The depth-1 star was a policy in `commit.py`, not a
+constraint on disk, so existing repositories stay readable and no version bump
+was needed.
+
+Three pieces:
+
+- `graph.tensor_anchor(store, commit, name)` -- follows one tensor's
+  `base_tensor_manifest` chain to its root, returning `(manifest, depth)`.
+  Derived entirely from objects already on disk.
+- `anchor.decide(ratio, depth)` -- a pure function. **ANCHOR** if
+  `ratio >= tau` (0.9, the same break-even reasoning as
+  `residual.NOT_ALIGNABLE_THRESHOLD`: at 1.0 raw wins outright) or if
+  `depth >= max_depth` (3, bounding FUSE read latency). **DELTA** otherwise.
+- `commit.CompositeBase` -- a third implementation of the `names()`/`spec()`/
+  `rows()` interface §5.5 describes, routing each tensor's reads to *its own*
+  anchor rather than one shared hub.
+
+Encoding runs twice: once against each tensor's current anchor (which is what
+produces `ratio`), then a second pass re-encoding only the promoted tensors with
+`base=None`. That second pass is close to free in the case it exists for --
+`encode_chunk`'s `allow_raw_fallback` was *already* storing those chunks raw
+every commit and then discarding the fact, so nothing promoted them and the next
+commit repeated the work. `UNUSABLE_TENSOR_FRACTION` (0.5) folds a commit where
+most tensors want re-anchoring back into a plain full commit, the same reasoning
+as `UNUSABLE_ANCHOR_FRACTION` one level down.
+
+**Measured on 24 sequential epochs of the 90M PlainCNN**
+(`~/Downloads/raw_checkpoints_90m`, real training, layers freezing at different
+epochs -- head and `features.7` at 15, `features.3` at 20, `features.28` at 23,
+while `features.21`/`features.24` move to the end):
+
+| policy | stored | ratio | full commits |
+|---|---:|---:|---:|
+| flat | 2,862,191,960 B | 64.50% | 6/24 |
+| adaptive | 2,827,058,583 B | **63.71%** | 8/24 |
+
+0.79pp smaller -- 33.5 MiB over the run -- while doing *more* full commits.
+Reconstruction depth and the latency it costs:
+
+| policy | max depth | depth 0 | depth 1 | depth 2 | `restore HEAD` |
+|---|---:|---:|---:|---:|---:|
+| flat | 1 | 676 | 1052 | 0 | 0.99 s |
+| adaptive | 2 | 869 | 442 | 417 | 1.01 s |
+
+`max_depth = 3` never bound. Adaptive leaves *more* tensors at depth 0 than flat
+does (869 vs 676), because a promoted tensor resets its own chain -- the deeper
+chains it creates are paid for by the tensors it takes off chains entirely. All
+48 commits across both policies restore byte-identical.
+
+**What the measurement actually says, which is not what the design predicted.**
+The per-tensor mixed-anchor set does engage here -- depth 2 appears, 417
+tensor-commits deep, which never happens on the small MLP fixtures. But it is
+not where the saving comes from. On `mnist_pair` (a 2-hidden-layer MLP whose two
+weight matrices carry 98.5% of the bytes and drift within 2-7% of each other at
+every epoch) adaptive wins **2.3pp** on both seeds -- a *larger* margin than the
+CNN with genuinely heterogeneous drift gets. What `decide` is really buying is
+better *timing* of whole-checkpoint re-anchoring, ratio-triggered rather than
+every 4th commit. The per-tensor granularity largely collapses into that through
+`UNUSABLE_TENSOR_FRACTION`, because layers within a CNN stage drift together
+even when stages differ.
+
+0.79pp for a second encode pass is a thin margin. The flag stays opt-in; making
+it the default wants a workload whose layers drift on genuinely independent
+schedules -- a frozen-backbone fine-tune, which this series is not.
+
 ### 4.4 Reconstruction
 
 To rebuild a tensor's rows `[start, stop)`:
@@ -925,7 +1005,10 @@ slice the concatenation back down to [start, stop)
 ```
 
 Only overlapping chunks are fetched — the property the FUSE read path depends
-on. Under the star the recursion is depth 1.
+on. Under the flat star the recursion is depth 1; under `--anchor-policy
+adaptive` it is bounded by `anchor.DEFAULT_MAX_DEPTH` (3, and measured to peak
+at 2 — §4.3.2). The recursion itself was always general, which is why that
+policy needed no reader change.
 
 #### 4.4.1 Two mistakes that cost 13× between them
 
@@ -1364,6 +1447,13 @@ everything imports it (put it anywhere else and you get a cycle).
 **Exit 4 is reserved for verification failures only.** Graders script against
 it; never reuse it for I/O errors.
 
+**`anchor.py`** — the per-tensor anchor policy (§4.3.2), one pure function of
+`(ratio, depth)`. Deliberately free of any repository access: the commit-time
+encode produces `ratio`, the on-disk manifest chain produces `depth`, and this
+only has to combine them — which is why it is worth keeping out of both
+`graph.py` (reads objects) and `codec/checkpoint.py` (does the encoding), and
+why its thresholds can be swept in a test without building a repo.
+
 **`store/atomic.py`** — the one durable-write primitive. The core is four
 steps:
 
@@ -1420,8 +1510,11 @@ Swallow it — the mapping frees when the last view dies.
 
 ### 5.3 `codec/chunk.py` and `codec/checkpoint.py`
 
-`chunk.py` is §4.1 in code: `dtype_spec`, `to_monotone_key`/`from_monotone_key`,
-`zigzag`/`unzigzag`, `encode_chunk`/`decode_chunk`, `plain_stream`.
+`chunk.py` is §4.1 in code: `dtype_spec`, `zigzag`/`unzigzag`,
+`shuffle`/`unshuffle`, `encode_chunk`/`decode_chunk`, `plain_stream`. (The
+monotone key that used to sit in front of the delta step is gone -- it left the
+encode path when byte shuffle replaced it, and its last consumer outside the
+codec, `materialize._ulp_gap`, now compares raw bit patterns directly.)
 
 `checkpoint.py` walks a checkpoint and produces manifests:
 
@@ -1441,6 +1534,12 @@ for name in target.names():
 tensor's fate is known. It exists so an unchanged tensor emits no objects at
 all; without it you write zero-delta chunks nothing references. Correct either
 way.
+
+`CheckpointResult.per_tensor` carries `(original, stored)` per tensor under the
+same accounting rules as the aggregates (dedup excluded, a reused tensor
+contributes `(original, 0)`). It is what §4.3.2's policy measures `ratio` from,
+and it also makes `commit --json` able to say *which* layers are expensive
+rather than folding everything into one number.
 
 ### 5.4 The chunk store
 
@@ -1538,6 +1637,14 @@ shapes identical.
 Also: `walk_first_parent` (for `log`), `commits_since_full` /
 `nearest_full_ancestor` (§4.3), `checkpoint_sizes` (derived, never stored —
 baking a summary into a hashed object forks identity on a null repack).
+
+For §4.3.2: `tensor_anchor(store, commit, name)` is `nearest_full_ancestor` at
+*tensor-manifest* granularity — it follows `base_tensor_manifest` links rather
+than commits, which is what lets one tensor's anchor differ from its siblings'.
+`CommitCheckpoint.from_manifest(store, name, hash)` builds a single-tensor view
+rooted directly at a manifest, bypassing the commit layer; every method reads
+through `_tensor_manifests` and `store`, so only `header_bytes` and `total_size`
+assume a real commit, and a per-tensor base source never calls either.
 
 ### 5.6 `materialize.py`
 
@@ -1743,6 +1850,40 @@ translation table fixes this; you must mmap.
 BatchNorm's `num_batches_tracked` stays int64. Every real fp16 checkpoint is
 mixed-dtype, so a codec that assumes one width per file breaks on the first
 real model.
+
+### 7.8 One variable, two meanings, one guard that destroyed the other
+
+`codec/checkpoint.py` used `base_manifest_hash` for two unrelated things
+depending on which branch a tensor took:
+
+- tensor described here -> it is this manifest's `base_tensor_manifest`
+  **pointer**, and must be null when no chunk actually references a base
+  (§3.4.3's if-and-only-if rule);
+- tensor **reused** (§4.5, unchanged since the base) -> it is the *identity of
+  the manifest being reused*, and must be a real hash.
+
+The guard enforcing the first rule ran unconditionally, so it nulled the second
+one too, writing a literal `null` into the checkpoint-manifest's tensor map.
+
+Reachable whenever a tensor is byte-identical to its base **and** every chunk
+chose `raw` over a delta encoding -- which is not exotic. `encode_chunk` keeps
+`is_identical` across its raw fallback deliberately (it describes the content,
+not the storage), and on a small all-zero buffer raw genuinely wins: measured on
+a real 448-element frozen bias, raw 19 bytes against escape 20. **One byte.**
+Bias-free conv layers store an all-zero bias; the moment such a layer stops
+training, the condition fires.
+
+What made it dangerous rather than merely wrong: `commit` reported success and
+exit 0, and only `restore`/`verify`/`log` -- later, separately -- crashed on the
+null. On the 24-epoch 90M CNN, **6 of 24 commits were corrupted, including
+HEAD**, with no error at write time. The MLP fixtures never caught it because
+nothing in them ever freezes, so no tensor is ever both unchanged *and*
+raw-encoded.
+
+The general lesson is the one §7.3 and §7.4 also make: when a variable's meaning
+depends on a branch taken later, a guard written for one meaning silently
+corrupts the other. Regression tests pin both halves in
+`tests/test_codec_checkpoint.py`.
 
 ---
 
