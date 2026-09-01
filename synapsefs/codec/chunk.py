@@ -35,8 +35,6 @@ __all__ = [
     "EncodedChunk",
     "encode_chunk",
     "decode_chunk",
-    # "to_monotone_key",
-    # "from_monotone_key",
     "zigzag",
     "unzigzag",
     "dtype_spec",
@@ -47,14 +45,14 @@ __all__ = [
     "unshuffle_to_array",
     "RAW",
     "RAW_ZSTD",
-    # "DELTA",
+    "DELTA",
     "RAW_SHUFFLE_ZSTD",
     "DELTA_SHUFFLE",
 ]
 
 RAW = "raw"
 RAW_ZSTD = "raw-zstd"
-# DELTA = "delta-zigzag-zstd"
+DELTA = "delta-zigzag-zstd"  # legacy encoding: decode-only, no longer written
 
 # Current encodings. The shuffle is part of the *stream definition* here, not a
 # compressor setting (see `shuffle`), so these carry their own names rather
@@ -162,61 +160,13 @@ def dtype_spec(dtype: str) -> Tuple[int, str]:
 
 
 # --------------------------------------------------------------------------
-# Step 1 -- bit pattern <-> monotone integer key (FORMAT.md section 8 step 1)
+# Step 1 (FORMAT.md section 8 step 1) used to run through a monotone integer
+# key -- an xor mask that made bit-pattern order match numeric order across
+# the sign boundary. Removed: nothing in the codec's encode/decode path calls
+# it any more (see the note below, at the delta step), and its last consumer
+# outside this file, `materialize._ulp_gap`, was rewritten to compare raw bit
+# patterns directly instead of carrying the dependency for one caller.
 # --------------------------------------------------------------------------
-#
-# All three key kinds are the same operation -- xor with a mask -- and differ
-# only in how the mask is derived. Writing it that way (rather than as three
-# separate branches, or as `np.where(is_neg, ~x, x ^ msb)`) matters for more
-# than tidiness: `np.where` evaluates *both* arms over the whole array, so it
-# allocates four temporaries per call on a multi-megabyte chunk. The masked
-# form is branchless and allocates two.
-
-
-# def _mask_forward(bits: np.ndarray, kind: str, msb, zero, shift) -> np.ndarray:
-#     if kind == SINT:
-#         return msb
-#     # FLOAT: sign set -> all-ones (a full complement); sign clear -> just the
-#     # sign bit. `zero - (bits >> shift)` is 0 or all-ones without a compare.
-#     return (zero - (bits >> shift)) | msb
-
-
-# def _mask_inverse(key: np.ndarray, kind: str, msb, one, zero, shift) -> np.ndarray:
-#     if kind == SINT:
-#         return msb
-#     # A key with its top bit *set* came from a non-negative float, so it needs
-#     # only the sign bit flipped back; a key with it clear needs the full
-#     # complement. That is the forward test inverted, hence the `^ one`.
-#     return (zero - ((key >> shift) ^ one)) | msb
-
-#
-# def to_monotone_key(bits: np.ndarray, kind: str) -> np.ndarray:
-#     """Map raw float bits to an integer that sorts in the same order as the float.
-#
-#     **No longer used by the codec.** Retained for two consumers: decoding the
-#     legacy `delta-zigzag-zstd` encoding, and `materialize.compare_sources`,
-#     which uses the integer distance between two keys as a ULP distance -- the
-#     scale-free way to say "these differ by one representable step".
-#
-#     Why it left the encode path: floats are stored sign-magnitude, so negative
-#     bit patterns run backwards, and this map (`bits ^ 0x8000` when positive,
-#     `~bits` when negative) makes integer order match numeric order. That
-#     matters for the 3-5%% of weights that cross zero between checkpoints. But a
-#     plain modular subtraction of raw bits is *also* exactly reversible, and
-#     measured across all adjacent pairs the key is worth only +0.07pp -- while
-#     costing 0.26/0.47/0.66pp at gaps 2/3/4, which is what the star topology
-#     actually produces. Weighted, dropping it wins ~0.22pp and removes the
-#     FLOAT/SINT distinction from the storage path entirely.
-#     """
-#     zero, _one, msb, shift = _consts(bits.dtype.itemsize)
-#     return bits ^ _mask_forward(bits, kind, msb, zero, shift)
-
-
-# def from_monotone_key(key: np.ndarray, kind: str) -> np.ndarray:
-#     """Exact inverse of `to_monotone_key`. Pinned by an exhaustive test over
-#     every 8- and 16-bit pattern, for all three key kinds."""
-#     zero, one, msb, shift = _consts(key.dtype.itemsize)
-#     return key ^ _mask_inverse(key, kind, msb, one, zero, shift)
 
 
 # --------------------------------------------------------------------------
@@ -685,7 +635,7 @@ def decode_chunk(
         ValueError: unknown `encoding`, a `delta-zigzag-zstd` chunk with no
             `base`, or a base whose element count disagrees with the residual.
     """
-    width, kind = dtype_spec(dtype)
+    width, _kind = dtype_spec(dtype)
     unsigned = _UINT_OF[width]
 
     stream = plain_stream(encoding, payload, decompressor=decompressor)
@@ -695,9 +645,8 @@ def decode_chunk(
 
     if encoding in (RAW, RAW_ZSTD, RAW_SHUFFLE_ZSTD):
         return values if values is not None else np.frombuffer(stream, dtype=unsigned)
-    #
-    # if base is None:
-    #     raise ValueError(f"{DELTA} chunk cannot be decoded without a base chunk")
+    if base is None:
+        raise ValueError(f"{encoding} chunk cannot be decoded without a base chunk")
     b_bits = _as_bits(base, width, "base")
 
     if encoding == DELTA_ZIGZAG_ESCAPE:
@@ -715,10 +664,8 @@ def decode_chunk(
             f"residual has {residual.size} elements but base chunk has {b_bits.size}"
         )
 
-    # if encoding == DELTA:
-    #     # Legacy: this encoding's residual is a zigzag over *monotone keys*,
-    #     # so it has to be undone in that space.
-    #     return from_monotone_key(
-    #         to_monotone_key(b_bits, kind) + unzigzag(residual), kind
-    #     )
+    # `DELTA` (legacy `delta-zigzag-zstd`) used to need undoing in monotone-key
+    # space here; that path and the key functions it depended on are gone
+    # (nothing writes `DELTA` any more), so every remaining delta encoding
+    # falls through to the same plain modular add.
     return (b_bits + residual).astype(unsigned, copy=False)
