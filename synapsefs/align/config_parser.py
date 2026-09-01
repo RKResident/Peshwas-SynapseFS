@@ -187,22 +187,78 @@ def infer_order(layers: list[Layer]) -> list[Layer] | None:
     return ordered + sorted(norms, key=lambda l: natural_key(l.stem))
 
 
+def _shared_prefix(a: str, b: str) -> int:
+    """How many leading dotted components two stems have in common."""
+    n = 0
+    for x, y in zip(a.split("."), b.split(".")):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _trailing_index(stem: str) -> str | None:
+    """The digits ending a stem's last component: `blocks.0.bn1` -> '1'."""
+    m = re.search(r"(\d+)$", stem.split(".")[-1])
+    return m.group(1) if m else None
+
+
 def host_of(norm: Layer, layers: list[Layer]) -> Layer:
-    """The layer whose output axis this norm sits on. Width decides, not order."""
+    """The layer whose output axis this norm sits on.
+
+    Width narrows the field; the NAME picks from what is left. Position is only
+    the last resort, and it must be, because in a constant-width network
+    position carries no information at all.
+
+    That is not hypothetical. `infer_order` orders the *backbone* and appends
+    every norm after it, so a norm's index says nothing about which layer it
+    normalises. Combined with an older "last matching layer behind me" rule and
+    a CNN whose every stage is the same width, all nine norms of the small CNN
+    fixture -- 36 tensors including every BatchNorm buffer -- landed in ONE
+    group alongside `blocks.3.conv2`, while each conv sat alone in its own.
+
+    Nothing downstream catches that. The permutation stays a valid bijection,
+    reconstruction still round-trips, and `verify --content` passes, because a
+    misgrouped buffer is permuted consistently with whatever group it landed
+    in. It shows up only as a worse residual, which reads as the codec
+    underperforming rather than as the topology being wrong.
+
+    So: prefer the candidate sharing the longest dotted prefix
+    (`blocks.0.bn1` -> `blocks.0.conv1`, not `blocks.3.conv2`), break ties on a
+    matching trailing index (`bn1` -> `conv1`, `bn2` -> `conv2`), and fall back
+    to the positional rule only when names offer nothing.
+    """
+    candidates = [l for l in layers
+                  if l.kind is not LayerKind.NORM and l.out_size == norm.out_size]
+    if not candidates:
+        produced = sorted({l.out_size for l in backbone(layers)})
+        raise UnsupportedArchitecture(
+            f"norm '{norm.stem}' has {norm.out_size} channels, which no conv or "
+            f"linear layer produces (widths present: {produced})"
+        )
+
+    best = max(_shared_prefix(norm.stem, c.stem) for c in candidates)
+    if best:
+        tied = [c for c in candidates
+                if _shared_prefix(norm.stem, c.stem) == best]
+        if len(tied) == 1:
+            return tied[0]
+        want = _trailing_index(norm.stem)
+        if want is not None:
+            exact = [c for c in tied if _trailing_index(c.stem) == want]
+            if len(exact) == 1:
+                return exact[0]
+        candidates = tied        # still ambiguous; positional decides among these
+
     at = layers.index(norm)
-    behind = [l for l in layers[:at]
-              if l.kind is not LayerKind.NORM and l.out_size == norm.out_size]
+    allowed = set(map(id, candidates))
+    behind = [l for l in layers[:at] if id(l) in allowed]
     if behind:
         return behind[-1]
-    ahead = [l for l in layers[at + 1:]
-             if l.kind is not LayerKind.NORM and l.out_size == norm.out_size]
+    ahead = [l for l in layers[at + 1:] if id(l) in allowed]
     if ahead:
         return ahead[0]
-    produced = sorted({l.out_size for l in backbone(layers)})
-    raise UnsupportedArchitecture(
-        f"norm '{norm.stem}' has {norm.out_size} channels, which no conv or "
-        f"linear layer produces (widths present: {produced})"
-    )
+    return candidates[0]
 
 
 def to_nodes(layers: list[Layer]) -> list[LayerNode]:
