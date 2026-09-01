@@ -32,17 +32,24 @@ def run(args: argparse.Namespace) -> dict:
     current_dir = Path(__file__).resolve().parent
     spp_path = current_dir.parent.parent / "networking/spp"
 
-    result = subprocess.run(
+    process = subprocess.Popen(
         [str(spp_path), "push", args.ip, args.port, args.branch],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=True,
+        bufsize=1,
     )
+
+    for line in process.stdout:
+        print(line, end="")
+
+    for line in process.stderr:
+        print(line, end="")
 
     return {
         "port": args.port,
-        "result": result.stdout,
-        "error_code": result.stderr
+        "result": process.stdout,
+        "error_code": process.stderr
     }
 
 def format_human(result: dict) -> str:
