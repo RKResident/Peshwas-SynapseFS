@@ -58,3 +58,5 @@ tools/tools/benchmark-bf16
 tools/tools/benchmark-mlp-seed1synapsefs/networking/spp
 .nvim/
 networking_test_target/
+crash_check.bash
+krish_bug/
