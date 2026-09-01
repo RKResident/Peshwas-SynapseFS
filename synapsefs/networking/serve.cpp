@@ -16,7 +16,7 @@ int serve(uint16_t port, bool ro) {
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if(server < 0) {
         perror("socket");
-        return 1;
+        return Err_NETWORK_ERROR;
     }
 
     int opt = 1;
@@ -30,12 +30,12 @@ int serve(uint16_t port, bool ro) {
     if(bind(server, (sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         close(server);
-        return 1;
+        return Err_NETWORK_ERROR;
     }
     if(listen(server, SOMAXCONN) < 0) {
         perror("listen");
         close(server);
-        return 1;
+        return Err_NETWORK_ERROR;
     }
     std::cout << "serving on port " << port << std::endl;
 
@@ -47,7 +47,7 @@ int serve(uint16_t port, bool ro) {
 
             perror("accept");
             close(server);
-            return 1;
+            return Err_NETWORK_ERROR;
         }
 
         uint8_t op;
@@ -64,24 +64,38 @@ int serve(uint16_t port, bool ro) {
 
         std::cerr << "client requested branch "
             << client_branch << std::endl;
+        if(!is_valid_branch_name(client_branch)) {
+            Status st = St_DECLINED;
+            send_all(client, &st, sizeof(st));
+            close(client);
+            continue;
+        }
 
         switch(static_cast<Operation>(op)) {
             case Operation::Op_PUSH:
-                // handle_push(client, branch);
                 if(!ro) {
+                    Status st = St_ACCEPTED;
+                    send_all(client, &st, sizeof(st));
                     pull(client, client_branch);
                 } else {
+                    Status st = St_DECLINED;
+                    send_all(client, &st, sizeof(st));
                     close(client);
                 }
                 break;
-            case Operation::Op_PULL:
-                // handle_pull(client, branch);
+            case Operation::Op_PULL: {
+                Status st = St_ACCEPTED;
+                send_all(client, &st, sizeof(st));
                 push(client, client_branch);
                 break;
-            default:
+                                     }
+            default: {
+                Status st = St_DECLINED;
+                send_all(client, &st, sizeof(st));
                 std::cerr << "unknown operation: "
                           << static_cast<int>(op) << std::endl;
                 break;
+                     }
         }
 
         close(client);

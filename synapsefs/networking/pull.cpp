@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -13,14 +14,21 @@
 #include "network_common.hpp"
 
 int pull(const int client, const std::string branch) {
+    if(!is_valid_branch_name(branch)) {
+        return Err_INVALID_INVOKATION;
+    }
     std::vector<Hash> req_hash_objects;
 
     uint32_t rho_len;
     if(!recv_all(client, &rho_len, sizeof(rho_len))) { return 1; }
     rho_len = ntohl(rho_len);
+    if((rho_len & err_high) == err_high) {
+        std::cerr << "peer error: " << get_err(rho_len ^ err_high);
+        return Err_PEER_ERROR;
+    }
     std::cout << "received required hash objects size (" << rho_len << " records)" << std::endl;
     req_hash_objects.resize(rho_len);
-    if(!recv_all(client, req_hash_objects.data(), rho_len * hash_len)) { return 1; }
+    if(!recv_all(client, req_hash_objects.data(), rho_len * hash_len)) { return Err_NETWORK_ERROR; }
     std::cout << "received required hash objects (" << rho_len << " records)" << std::endl;
 
     // char instead of bool cuz std::vector<bool> is weird and stupid and horrible
@@ -30,7 +38,7 @@ int pull(const int client, const std::string branch) {
     for(const Hash &h : req_hash_objects) {
         if(!is_hex_hash(h)) {
             std::cerr << "peer sent a non-hex object hash; refusing" << std::endl;
-            return 1;
+            return Err_INVALID_HASH;
         }
     }
 
@@ -38,7 +46,7 @@ int pull(const int client, const std::string branch) {
         hash_exists[i] = has_hash(req_hash_objects[i]);
     }
     std::cout << "sending hash status..." << std::endl;
-    if(!send_all(client, hash_exists.data(), hash_exists.size())) { return 1; }
+    if(!send_all(client, hash_exists.data(), hash_exists.size())) { return Err_NETWORK_ERROR; }
     std::cout << "sent hash status" << std::endl;
     
     for(uint32_t i = 0; i < rho_len; i++) {
@@ -47,39 +55,51 @@ int pull(const int client, const std::string branch) {
             continue;
         }
         std::cout << "receiving hash " << req_hash_objects[i] << "..." << std::endl;
-        if(!recv_file(client, hash_path(req_hash_objects[i]))) { return 1; }
+        if(int err = recv_file(client, hash_path(req_hash_objects[i]))) {
+            return err;
+        }
         std::cout << "received hash " << req_hash_objects[i] << std::endl;
     }
 
     if(req_hash_objects.empty()) {
         std::cerr << "peer sent no objects for branch '" << branch
                   << "'; leaving refs untouched" << std::endl;
-        return 1;
+        return Err_INVALID_DATA;
     }
 
     std::filesystem::path branch_head_path = branch_path(branch);
     std::error_code ec;
     std::filesystem::create_directories(branch_head_path.parent_path(), ec);
     if(ec) {
-        std::cerr << "failed to create head directory: " << ec.message() << std::endl;
-        return 1;
+        std::cerr << "failed to create branch directory: " << ec.message() << std::endl;
+        return Err_FILESYSTEM_ERROR;
     }
 
-    std::ofstream file(branch_head_path);
+    std::filesystem::path branch_head_tmp_path = tmp_path(branch);
+    std::filesystem::create_directories(branch_head_tmp_path.parent_path(), ec);
+    if(ec) {
+        std::cerr << "failed to create temporary directory: " << ec.message() << std::endl;
+        return Err_FILESYSTEM_ERROR;
+    }
+    std::ofstream file(branch_head_tmp_path);
     if(!file) {
-        std::cerr << "could not create branch file" << std::endl;
-        return 1;
+        std::cerr << "could not create temporary file" << std::endl;
+        return Err_FILESYSTEM_ERROR;
     }
     file << req_hash_objects.back();
     file.close();
     if(!file) {
-        std::cerr << "could not write to branch file" << std::endl;
-        return 1;
+        std::cerr << "could not write to temporary file" << std::endl;
+        return Err_FILESYSTEM_ERROR;
     }
 
-    if(!recv_file(client, head_path())) { return 1; }
+    std::filesystem::rename(branch_head_tmp_path, branch_head_path, ec);
+    if(ec) {
+        std::filesystem::remove(branch_head_tmp_path);
+        return Err_FILESYSTEM_ERROR;
+    }
+    std::cout << "Transfer Complete" << std::endl;
 
-    close(client);
     return 0;
 }
 
