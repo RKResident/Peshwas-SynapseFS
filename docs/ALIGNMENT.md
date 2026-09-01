@@ -143,11 +143,19 @@ config key names vary by architecture. What config *is* good for is disagreeing
   plausible-looking graph that aligns nothing.
 - `infer_order(layers)` — recovers the true order from shape divisibility when
   names cannot supply it, via `can_follow(consumer, producer)`.
-- `host_of(norm, layers)` — norms attach **by width, not position**.
-  `bn1, bn2, conv1, conv2` sorts both norms ahead of every conv, so position
-  would put them on the input axis. A norm's width equals its producer's output
-  width, so its host is the nearest layer — backward first, then forward —
-  producing exactly that many channels. Its parameters *and* `running_mean` /
+- `host_of(norm, layers)` — norms attach **by name, then width, never by
+  position alone**. `bn1, bn2, conv1, conv2` sorts both norms ahead of every
+  conv, so position would put them on the input axis; and `infer_order` appends
+  norms *after* the whole backbone, so their index carries no information at
+  all. Width alone is not enough either: in a constant-width CNN every norm
+  matches every conv, and a position tie-break then collapses all of them onto
+  one layer.
+
+  So the rule is: filter to non-norm layers of the same output width, then pick
+  the candidate sharing the **longest dotted name prefix** (`blocks.3.bn2` ->
+  `blocks.3.*`), breaking a remaining tie on the trailing index (`bn2` -> `conv2`).
+  Only when names supply nothing does it fall back to nearest-by-position,
+  backward first then forward. Its parameters *and* `running_mean` /
   `running_var` join that host's group. Those buffers are per output channel
   and **must** move with the permutation; leaving them behind is invisible
   under identity and wrong under every real permutation.

@@ -25,11 +25,9 @@ from synapsefs.codec.chunk import (
     unshuffle,
     shuffle,
     DELTA_SHUFFLE,
-    FLOAT,
     RAW,
     RAW_ZSTD,
     RAW_SHUFFLE_ZSTD,
-    SINT,
     EncodedChunk,
     decode_chunk,
     dtype_spec,
@@ -38,13 +36,10 @@ from synapsefs.codec.chunk import (
     _escape_stream,
     _unescape_stream,
     is_delta,
-    from_monotone_key,
-    to_monotone_key,
     unzigzag,
     zigzag,
 )
 
-ALL_KINDS = [FLOAT, SINT]
 ALL_U16 = np.arange(65536, dtype=np.uint16)
 
 # 16 bits is the only width small enough to enumerate, and it is also the
@@ -54,34 +49,21 @@ ALL_U16 = np.arange(65536, dtype=np.uint16)
 
 
 # ---------------------------------------------------------------------------
-# Step 1: monotone key
+# Steps 2-3: zigzag
+#
+# The monotone key that used to sit in front of this step (an xor mask making
+# bit-pattern order match float order across the sign boundary) is gone --
+# nothing in the encode/decode path calls it, and its tests went with it. What
+# remains is plain modular subtraction plus zigzag, which is what the codec
+# has actually used since `codec/chunk.py`'s "no monotone key" note.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ALL_KINDS)
-@pytest.mark.parametrize("domain", [ALL_U16], ids=["16bit"])
-def test_monotone_key_roundtrips_over_entire_domain(kind, domain):
-    """Every bit pattern, every key kind, both widths. This is the test that
-    makes "byte-exact" a fact rather than an aspiration."""
-    assert np.array_equal(from_monotone_key(to_monotone_key(domain, kind), kind), domain)
-
-
-@pytest.mark.parametrize("kind", ALL_KINDS)
-@pytest.mark.parametrize("domain", [ALL_U16], ids=["16bit"])
-def test_monotone_key_is_a_permutation(kind, domain):
-    """Round-tripping alone would also pass for a map that collapsed two
-    patterns onto one and got lucky; requiring a bijection rules that out."""
-    keys = to_monotone_key(domain, kind)
-    assert len(np.unique(keys)) == len(domain)
-    assert keys.dtype == domain.dtype  # never silently widens
-
-
-@pytest.mark.parametrize("kind", ALL_KINDS)
 @pytest.mark.parametrize("width", [2, 4, 8])
-def test_key_and_zigzag_roundtrip_at_every_supported_width(kind, width):
-    """The exhaustive tests above only reach 16 bits. The codec also has to be
-    right at 4 and 8 bytes (F32, and the int64 BatchNorm counter), including
-    the extremes where the mask and the zigzag wrap."""
+def test_zigzag_roundtrips_at_every_supported_width(width):
+    """The exhaustive 16-bit tests below only reach one width. The codec also
+    has to be right at 4 and 8 bytes (F32, and the int64 BatchNorm counter),
+    including the extremes where the wraparound bites."""
     unsigned = {2: np.uint16, 4: np.uint32, 8: np.uint64}[width]
     hi = np.iinfo(unsigned).max
     rng = np.random.default_rng(width)
@@ -89,49 +71,7 @@ def test_key_and_zigzag_roundtrip_at_every_supported_width(kind, width):
         np.array([0, 1, hi, hi - 1, hi // 2, hi // 2 + 1], dtype=unsigned),
         rng.integers(0, hi, size=4096, dtype=np.uint64).astype(unsigned),
     ])
-    assert np.array_equal(from_monotone_key(to_monotone_key(domain, kind), kind), domain)
     assert np.array_equal(unzigzag(zigzag(domain)), domain)
-
-
-def test_float_key_orders_like_the_float_value():
-    """The *point* of the key: unsigned key order must match float order, so
-    that a small change in value is a small integer delta. Without this the
-    round-trip still works and compression quietly collapses."""
-    values = ALL_U16.view(np.float16)
-    finite = ~np.isnan(values)
-    keys = to_monotone_key(ALL_U16, FLOAT)[finite]
-    ordered = values[finite][np.argsort(keys)]
-    assert np.all(np.diff(ordered) >= 0)
-
-
-def test_sint_key_orders_like_the_signed_value():
-    keys = to_monotone_key(ALL_U16, SINT)
-    ordered = ALL_U16.view(np.int16)[np.argsort(keys)]
-    assert np.all(np.diff(ordered) >= 0)
-
-
-def test_signed_zeros_stay_distinct():
-    """FORMAT.md section 8 calls this out explicitly: any "normalization" of
-    signed zero breaks byte-exactness. +0.0 and -0.0 are adjacent keys, and
-    they are not the same key."""
-    keys = to_monotone_key(ALL_U16, FLOAT)
-    assert keys[0x0000] == 0x8000  # +0.0
-    assert keys[0x8000] == 0x7FFF  # -0.0
-    assert keys[0x0000] != keys[0x8000]
-
-
-def test_nan_and_inf_need_no_special_case():
-    values = ALL_U16.view(np.float16)
-    exotic = ALL_U16[np.isnan(values) | np.isinf(values)]
-    assert exotic.size > 0
-    assert np.array_equal(
-        from_monotone_key(to_monotone_key(exotic, FLOAT), FLOAT), exotic
-    )
-
-
-# ---------------------------------------------------------------------------
-# Steps 2-3: zigzag
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("domain", [ALL_U16], ids=["16bit"])
@@ -513,7 +453,7 @@ def test_shuffle_actually_shrinks_a_residual():
     target = (base + rng.integers(0, 8, size=8192, dtype=np.uint16)).astype(np.uint16)
 
     shuffled = encode_chunk(target, base, dtype="F16")
-    delta = (to_monotone_key(target, FLOAT) - to_monotone_key(base, FLOAT)).astype(np.uint16)
+    delta = (target - base).astype(np.uint16)
     unshuffled = len(zstd.ZstdCompressor(level=DEFAULT_LEVEL).compress(delta.tobytes()))
     assert shuffled.stored_len < unshuffled
 
@@ -526,7 +466,7 @@ def test_the_encoder_no_longer_zigzags():
     target = (base + 300).astype(np.uint16)
     chunk = encode_chunk(target, base, dtype="F16")
 
-    delta = (to_monotone_key(target, FLOAT) - to_monotone_key(base, FLOAT)).astype(np.uint16)
+    delta = (target - base).astype(np.uint16)
     assert plain_stream(chunk.encoding, chunk.payload) == shuffle(delta.tobytes(), 2)
 
 
@@ -539,26 +479,32 @@ def test_the_hash_covers_the_shuffled_stream():
         == chunk.content_hash
 
 
-@pytest.mark.parametrize("encoding", [RAW_ZSTD, DELTA])
-def test_unshuffled_encodings_still_decode(encoding):
-    """Chunks written before the shuffle landed must keep decoding. The two old
-    names are not aliases of the new ones -- they mean 'this stream was never
-    shuffled' -- so decode must not un-shuffle them."""
+def test_unshuffled_encodings_still_decode():
+    """Chunks written before the shuffle landed must keep decoding. `RAW_ZSTD`
+    is not an alias of `RAW_SHUFFLE_ZSTD` -- it means 'this stream was never
+    shuffled' -- so decode must not un-shuffle it.
+
+    `DELTA` (`delta-zigzag-zstd`) was the other pre-shuffle encoding, but it is
+    no longer decodable at all: its residual was a zigzag over monotone keys,
+    and both the un-zigzag path and the key functions it depended on are gone.
+    Nothing writes it any more either, so this only needs to cover the
+    survivor."""
     base = np.arange(256, dtype=np.uint16)
     target = base + 7
     compressor = zstd.ZstdCompressor(level=DEFAULT_LEVEL)
 
-    if encoding is RAW_ZSTD:
-        stream, expected = target.tobytes(), target
-    else:
-        delta = to_monotone_key(target, FLOAT) - to_monotone_key(base, FLOAT)
-        stream, expected = zigzag(delta.astype(np.uint16)).tobytes(), target
-
     decoded = decode_chunk(
-        encoding, compressor.compress(stream),
-        None if encoding is RAW_ZSTD else base, dtype="F16",
+        RAW_ZSTD, compressor.compress(target.tobytes()), None, dtype="F16",
     )
-    assert np.array_equal(decoded, expected)
+    assert np.array_equal(decoded, target)
+
+
+def test_delta_legacy_encoding_is_no_longer_decodable():
+    """Pinned rather than silently true: `DELTA` used to decode via the
+    monotone key, and now raises instead of silently reinterpreting the
+    stream as plain-modular residual bytes it never was."""
+    with pytest.raises(ValueError):
+        decode_chunk(DELTA, b"\x00\x00", np.arange(1, dtype=np.uint16), dtype="F16")
 
 
 def test_the_encoder_no_longer_uses_the_monotone_key():

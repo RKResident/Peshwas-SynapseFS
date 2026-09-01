@@ -54,7 +54,7 @@ from contextlib import ExitStack
 import blake3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Protocol, Union
+from typing import Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 
@@ -156,6 +156,19 @@ class CheckpointResult:
     tensor does not grow a residual chain. Without this, a frozen tensor
     accumulates one zero-delta hop per commit and reconstruction pointlessly
     walks all of them.
+    """
+
+    per_tensor: Dict[str, "Tuple[int, int]"]
+    """tensor name -> `(original_bytes, stored_bytes)` for that tensor alone,
+    same accounting rules as the aggregate fields above (dedup excluded from
+    `stored_bytes`, a reused tensor contributes `(original, 0)`).
+
+    This is the measurement `synapsefs.anchor.decide` runs on: the aggregate
+    counters answer "how did this commit do", but the anchor policy has to
+    ask that question per tensor, before deciding whether any single one of
+    them should stop diffing against a stale base. Also surfaces through
+    `commit --json` so which layers are expensive is visible rather than
+    folded into one number.
     """
 
     notes: List[str]
@@ -326,6 +339,8 @@ def encode_checkpoint(
     manifests: Dict[str, dict] = {}
     seen_hashes: set = set()
     reused_manifests: Dict[str, str] = {}
+    per_tensor_stored: Dict[str, int] = {}
+    per_tensor: Dict[str, Tuple[int, int]] = {}
     tensors = 0
     original_bytes = 0
     stored_bytes = 0
@@ -337,7 +352,8 @@ def encode_checkpoint(
         """Dedup, count, and emit one chunk.
 
         Byte counters follow the same branch as the chunk itself: a deduped
-        chunk costs nothing on disk, so it must not land in `stored_bytes`.
+        chunk costs nothing on disk, so it must not land in `stored_bytes`
+        (and by the same rule, not in `per_tensor_stored`).
         """
         nonlocal chunks_new, chunks_deduped, stored_bytes, deduped_bytes
         if record.content_hash in seen_hashes:
@@ -352,6 +368,9 @@ def encode_checkpoint(
         seen_hashes.add(record.content_hash)
         chunks_new += 1
         stored_bytes += len(record.payload)
+        per_tensor_stored[record.tensor] = (
+            per_tensor_stored.get(record.tensor, 0) + len(record.payload)
+        )
         emit(record)
 
     with ExitStack() as stack:
@@ -519,7 +538,35 @@ def encode_checkpoint(
                 # chunk actually references it. The per-chunk raw fallback can
                 # take every chunk of a tensor, which would otherwise leave a
                 # base pointing at nothing.
-                if not any(is_delta(c["encoding"]) for c in chunk_entries):
+                #
+                # `not unchanged` is load-bearing. Below, `base_manifest_hash`
+                # feeds two different consumers meaning two different things:
+                # for a tensor we describe ourselves it is this manifest's
+                # `base_tensor_manifest` *pointer*, which the invariant above
+                # is about; for a reused tensor it is the *identity of the
+                # manifest being reused* (FORMAT.md 4.5), which the invariant
+                # has nothing to say about. Nulling it on the reuse path wrote
+                # a literal null into the checkpoint-manifest's tensor map --
+                # a dangling pointer that `commit` reported as success and
+                # that then crashed `restore`, `verify` and `log`.
+                #
+                # It fires on a tensor byte-identical to its base whose chunks
+                # all chose RAW over DELTA -- legitimate, and common on the
+                # small buffers a frozen BatchNorm layer leaves behind, where
+                # zstd's frame overhead dominates and the two encodings land
+                # within a byte of each other (measured: raw 19, escape 20, on
+                # a 448-element frozen bias). `encode_chunk` keeps
+                # `is_identical` across that fallback deliberately -- it is a
+                # fact about the content, not about how it was stored -- so
+                # "identical" and "delta-encoded" are genuinely independent
+                # and this path is reachable whenever a layer stops training.
+                #
+                # Safe by construction: `unchanged` implies `still_identical`,
+                # which was initialised from `base_manifest_hash is not None`,
+                # so on this path the hash is always a real one.
+                if not unchanged and not any(
+                    is_delta(c["encoding"]) for c in chunk_entries
+                ):
                     base_manifest_hash = None
 
                 if not unchanged:
@@ -541,6 +588,8 @@ def encode_checkpoint(
                     content_digest.hexdigest(), perm,
                 )
 
+            per_tensor[name] = (spec.nbytes, per_tensor_stored.get(name, 0))
+
     return CheckpointResult(
         manifests=manifests,
         header_bytes=header_bytes,
@@ -551,5 +600,6 @@ def encode_checkpoint(
         chunks_new=chunks_new,
         chunks_deduped=chunks_deduped,
         reused_manifests=reused_manifests,
+        per_tensor=per_tensor,
         notes=notes,
     )

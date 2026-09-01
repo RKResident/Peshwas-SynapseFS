@@ -335,3 +335,52 @@ def test_committing_on_a_detached_head_is_refused(tmp_path):
 
     exit_code = main(["-C", str(repo_dir), "commit", str(paths[0]), "-m", "x"])
     assert exit_code == 2  # CLI.md: USAGE
+
+
+def test_tensor_anchor_resolves_a_frozen_tensor_to_the_root_at_depth_zero(tmp_path):
+    """`frozen` never changes, so FORMAT.md 4.5's reuse rule points every
+    commit straight at the root's manifest for it -- `tensor_anchor` should
+    see that manifest with no base, at depth 0, from anywhere in the chain."""
+    repo_dir = make_repo(tmp_path)
+    commit_series(tmp_path, repo_dir, 9)
+    repo = Repo.find(repo_dir)
+
+    rows = lineage(repo)
+    root_manifest = rows[0]["checkpoint_manifest"]
+    root_tensors = graph.get_json(repo.store, root_manifest)["tensors"]
+
+    for commit in rows:
+        manifest_hash, depth = graph.tensor_anchor(repo.store, commit["_hash"], "frozen")
+        assert depth == 0
+        assert manifest_hash == root_tensors["frozen"]
+
+
+def test_tensor_anchor_depth_matches_the_current_flat_star(tmp_path):
+    """Today's policy in `commit.py` gives every tensor the same single-hop
+    star `test_commits_form_a_star_so_reconstruction_is_always_one_hop`
+    checks structurally -- so a changing tensor's `tensor_anchor` depth must
+    be exactly 0 on a full commit and exactly 1 on every residual commit
+    against it. `CompositeBase`'s per-tensor policy is what will make depth
+    grow past 1 for a real drifting tensor; this pins the baseline it starts
+    from."""
+    repo_dir = make_repo(tmp_path)
+    commit_series(tmp_path, repo_dir, 9)
+    repo = Repo.find(repo_dir)
+
+    for commit in lineage(repo):
+        _hash, depth = graph.tensor_anchor(repo.store, commit["_hash"], "head")
+        assert depth == (0 if commit["full"] else 1), commit["message"]
+
+
+def test_tensor_anchor_on_a_missing_tensor_returns_none_not_zero(tmp_path):
+    """`(None, 0)` (no such tensor) must not be confused with `(hash, 0)` (a
+    real anchor at depth 0) -- a caller checking only the depth would
+    silently treat a typo'd name as an anchor."""
+    repo_dir = make_repo(tmp_path)
+    commit_series(tmp_path, repo_dir, 1)
+    repo = Repo.find(repo_dir)
+    head = repo.resolve_ref("HEAD")
+
+    manifest_hash, depth = graph.tensor_anchor(repo.store, head, "does_not_exist")
+    assert manifest_hash is None
+    assert depth == 0

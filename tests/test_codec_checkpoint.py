@@ -664,3 +664,87 @@ def test_stored_bytes_excludes_chunks_the_store_already_has(tmp_path):
     assert result.deduped_bytes > 0
     # The manifest is unaffected -- dedup changes storage, never the manifest.
     assert result.manifests["w"]["chunks"]
+
+
+# --------------------------------------------------------------------------
+# 9. The reuse pointer is never null (regression)
+# --------------------------------------------------------------------------
+
+
+def test_an_all_zero_unchanged_tensor_reuses_a_real_manifest_hash(tmp_path):
+    """`reused_manifests` must never carry a null hash.
+
+    Regression for a silent repository corruption. An all-zero tensor that
+    does not change between commits -- a bias-free conv layer's zero bias, or
+    any buffer a frozen layer leaves behind -- is byte-identical to its base,
+    so FORMAT.md 4.5's reuse rule applies. But its chunks encode *raw*, not
+    delta: an all-zero raw stream and an all-zero residual land within a byte
+    of each other once zstd's frame overhead dominates (measured on a real
+    448-element frozen bias: raw 19, escape 20), and `encode_chunk`'s raw
+    fallback takes the smaller one while deliberately keeping `is_identical`
+    -- that flag describes the content, not the encoding.
+
+    `encode_checkpoint` then nulled the base pointer, because no chunk was a
+    delta, and wrote that null into `reused_manifests`, where it means
+    something else entirely: the identity of the manifest to reuse. `commit`
+    reported success and `restore`/`verify`/`log` crashed on every commit
+    from that point on.
+
+    Found on a real 24-epoch CNN run, where 6 of 24 commits -- including
+    HEAD -- became unrestorable. Not caught by the MLP fixtures: nothing in
+    them ever freezes, so no tensor is ever both unchanged *and* raw-encoded.
+    """
+    base_path = tmp_path / "base.safetensors"
+    target_path = tmp_path / "target.safetensors"
+
+    frozen = np.zeros(448, dtype=np.float16)      # the bias-free conv layer
+    moving = np.arange(64, dtype=np.float16).reshape(8, 8)
+
+    save_file({"frozen": frozen, "moving": moving}, str(base_path))
+    save_file({"frozen": frozen.copy(), "moving": moving + np.float16(1)},
+              str(target_path))
+
+    base_manifests = {"frozen": "a" * 64, "moving": "b" * 64}
+    result = encode_checkpoint(
+        target_path, base_path, emit=_collect({}), base_manifests=base_manifests,
+    )
+
+    # The precondition this test exists for: unchanged, and stored raw.
+    assert "frozen" in result.reused_manifests, (
+        "an unchanged tensor must take the reuse path"
+    )
+    # And the property that was broken: a reuse pointer is a real hash.
+    for name, manifest_hash in result.reused_manifests.items():
+        assert manifest_hash is not None, f"{name} reuses a null manifest hash"
+    assert result.reused_manifests["frozen"] == base_manifests["frozen"]
+
+
+def test_a_changed_all_raw_tensor_still_drops_its_unused_base_pointer(tmp_path):
+    """The other half of the same branch, so the fix cannot overshoot.
+
+    When a tensor *did* change but every chunk still fell back to raw, the
+    manifest we write must not name a base no chunk references -- that would
+    make reconstruction walk into a manifest contributing zero bytes and force
+    GC to retain the subtree behind it. Only the reuse path is exempt.
+    """
+    base_path = tmp_path / "base.safetensors"
+    target_path = tmp_path / "target.safetensors"
+
+    rng = np.random.default_rng(0)
+    base = rng.standard_normal((32, 32)).astype(np.float16)
+    # Unrelated content: the residual cannot beat storing the target raw.
+    target = (rng.standard_normal((32, 32)) * 1000).astype(np.float16)
+
+    save_file({"w": base}, str(base_path))
+    save_file({"w": target}, str(target_path))
+
+    result = encode_checkpoint(
+        target_path, base_path, emit=_collect({}),
+        base_manifests={"w": "c" * 64},
+    )
+
+    manifest = result.manifests["w"]
+    if not any(is_delta(c["encoding"]) for c in manifest["chunks"]):
+        assert manifest["base_tensor_manifest"] is None, (
+            "a manifest whose chunks are all raw must not name a base"
+        )
