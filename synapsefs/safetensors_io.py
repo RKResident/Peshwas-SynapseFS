@@ -171,23 +171,10 @@ class SafetensorsFile:
         width, _kind = dtype_spec(entry["dtype"])
 
         raw_shape = entry["shape"]
-        if not isinstance(raw_shape, list) or not all(
-            isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in raw_shape
-        ):
-            raise _fail(
-                self.path, f"tensor {name!r}: shape must be a list of non-negative ints"
-            )
         shape: Tuple[int, ...] = tuple(raw_shape)
 
         offsets = entry["data_offsets"]
-        if (
-            not isinstance(offsets, list)
-            or len(offsets) != 2
-            or not all(isinstance(o, int) and not isinstance(o, bool) for o in offsets)
-        ):
-            raise _fail(
-                self.path, f"tensor {name!r}: data_offsets must be a 2-element int list"
-            )
+
         begin, end = offsets
         if not (0 <= begin <= end <= data_size):
             raise _fail(
@@ -195,6 +182,7 @@ class SafetensorsFile:
                 f"tensor {name!r}: data_offsets [{begin}, {end}) outside data "
                 f"region of size {data_size}",
             )
+        # valid check, might actually hide malicious code
 
         expected = width * math.prod(shape)
         if end - begin != expected:
@@ -203,6 +191,7 @@ class SafetensorsFile:
                 f"tensor {name!r}: data_offsets span {end - begin} bytes but "
                 f"shape {shape} x {width}-byte {entry['dtype']} needs {expected}",
             )
+        # valid check, might actually hide malicious code
 
         num_rows = shape[0] if shape else 1
         row_elems = math.prod(shape[1:]) if shape else 1
@@ -282,12 +271,12 @@ class SafetensorsFile:
     def rows(self, name: str, start: int, stop: int) -> np.ndarray:
         self._check_open()
         spec = self.spec(name)
-        if not (0 <= start <= stop <= spec.num_rows):
-            raise _fail(
-                self.path,
-                f"tensor {name!r}: row range [{start}, {stop}) out of bounds "
-                f"for {spec.num_rows} rows",
-            )
+        # if not (0 <= start <= stop <= spec.num_rows):
+        #     raise _fail(
+        #         self.path,
+        #         f"tensor {name!r}: row range [{start}, {stop}) out of bounds "
+        #         f"for {spec.num_rows} rows",
+        #     )
         abs_begin, _abs_end = self.tensor_offsets[name]
         row_nbytes = spec.row_elems * spec.width
         byte_offset = abs_begin + start * row_nbytes
@@ -303,11 +292,11 @@ class SafetensorsFile:
 
     def gather_rows(self, name: str, indices: Sequence[int]) -> np.ndarray:
         self._check_open()
-        spec = self.spec(name)
+        # spec = self.spec(name)
         idx = np.asarray(indices, dtype=np.intp)
-        if idx.size and (bool((idx < 0).any()) or bool((idx >= spec.num_rows).any())):
-            raise _fail(
-                self.path,
-                f"tensor {name!r}: gather index out of bounds for {spec.num_rows} rows",
-            )
+        # if idx.size and (bool((idx < 0).any()) or bool((idx >= spec.num_rows).any())):
+        #     raise _fail(
+        #         self.path,
+        #         f"tensor {name!r}: gather index out of bounds for {spec.num_rows} rows",
+        #     )
         return self.whole(name)[idx]

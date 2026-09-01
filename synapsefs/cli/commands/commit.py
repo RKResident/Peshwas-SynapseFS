@@ -21,10 +21,11 @@ import argparse
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import json
 
+from synapsefs import anchor as anchor_policy
 from synapsefs import graph
 from synapsefs.align import config_parser, lap, report as align_report, solver
 from synapsefs.align.Error import AlignError
@@ -42,6 +43,84 @@ from synapsefs.store.repo import Repo
 #: Not fired under --no-align: that path skips the residual pass, so
 #: `not_alignable` only ever contains missing or shape-mismatched tensors.
 UNUSABLE_ANCHOR_FRACTION = 0.5
+
+#: Fraction of tensors the adaptive policy may re-anchor in one commit before
+#: giving up on per-tensor granularity and storing the whole checkpoint full
+#: instead -- the same reasoning as `UNUSABLE_ANCHOR_FRACTION`, one level
+#: down: if most tensors need a fresh anchor, the anchor was a bad base for
+#: this checkpoint as a whole, and a mix of promoted and un-promoted tensors
+#: buys nothing over just starting a new hub.
+UNUSABLE_TENSOR_FRACTION = 0.5
+
+
+class CompositeBase:
+    """Routes each tensor's rows to *that tensor's own* anchor, rather than
+    one shared anchor for the whole checkpoint.
+
+    `encode_checkpoint` only ever asks a base source for `names()`, `spec()`,
+    `rows()` and `gather_rows()` -- the same three-or-four methods
+    `SafetensorsFile` and `graph.CommitCheckpoint` already implement
+    identically (ARCHITECTURE.md 5.5), so a router that dispatches each call
+    to the right per-tensor reader is a drop-in third implementation, not a
+    special case threaded through the codec.
+
+    Built from `{name: manifest_hash}` -- each tensor's current anchor, found
+    by `graph.tensor_anchor` before encoding starts. Readers are
+    `graph.CommitCheckpoint.from_manifest` instances, cached one per tensor
+    name so a tensor touched more than once (there is currently exactly one
+    read per tensor per commit, but nothing here assumes that) does not
+    re-parse its anchor's manifest twice.
+    """
+
+    def __init__(self, store, anchors: Dict[str, str]):
+        self._store = store
+        self._anchors = dict(anchors)
+        self._readers: Dict[str, graph.CommitCheckpoint] = {}
+
+    def _reader(self, name: str) -> graph.CommitCheckpoint:
+        reader = self._readers.get(name)
+        if reader is None:
+            reader = graph.CommitCheckpoint.from_manifest(
+                self._store, name, self._anchors[name]
+            )
+            self._readers[name] = reader
+        return reader
+
+    def names(self) -> List[str]:
+        return list(self._anchors)
+
+    def refs(self):
+        """`{name: TensorSpec}` -- the solver (`align.solver._shapes`) probes
+        for this attribute directly on whatever base it is given, the same
+        way `graph.CommitCheckpoint.refs` does."""
+        return {name: self.spec(name) for name in self.names()}
+
+    def spec(self, name: str):
+        return self._reader(name).spec(name)
+
+    def rows(self, name: str, start: int, stop: int):
+        return self._reader(name).rows(name, start, stop)
+
+    def gather_rows(self, name: str, indices):
+        return self._reader(name).gather_rows(name, indices)
+
+    def as_float(self, name: str):
+        """The alignment objective (`align.objective._fetch`) prefers this
+        over `__getitem__`/subscripting when it exists -- same delegation as
+        every other method here, straight to the per-tensor reader's own
+        `CommitCheckpoint.as_float`."""
+        return self._reader(name).as_float(name)
+
+    def tensor_manifest_hashes(self) -> Dict[str, str]:
+        """tensor name -> its current anchor's manifest hash.
+
+        Same contract `graph.CommitCheckpoint.tensor_manifest_hashes` makes to
+        `encode_checkpoint(base_manifests=...)`, just per-tensor instead of
+        per-commit -- this is what lets `base_tensor_manifest` end up correct
+        even when two tensors in the same commit are diffed against different
+        anchors.
+        """
+        return dict(self._anchors)
 
 
 def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
@@ -96,6 +175,16 @@ def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
         "--strict", action="store_true",
         help="Exit 5 instead of 0 when a tensor is not meaningfully"
              " alignable.",
+    )
+    parser.add_argument(
+        "--anchor-policy", choices=["flat", "adaptive"], default="flat",
+        help="How each tensor picks its diff base. 'flat' (default): every"
+             " tensor in a commit diffs against the same commit-level anchor,"
+             " which resets for the whole checkpoint every REBASE_INTERVAL"
+             " commits. 'adaptive': each tensor is judged on its own measured"
+             " drift (synapsefs.anchor) and may ride a distant anchor, or"
+             " re-anchor on its own, independently of every other tensor in"
+             " the same commit.",
     )
     # func/format_human ride on the namespace so main.py can dispatch and
     # render without knowing anything about "commit" specifically.
@@ -184,9 +273,36 @@ def run(args: argparse.Namespace) -> dict:
     store_full = anchor is None or since_full >= graph.REBASE_INTERVAL - 1
 
     notes: list = []
-    base_source = (
-        None if store_full else graph.CommitCheckpoint(store, anchor)
-    )
+    adaptive = getattr(args, "anchor_policy", "flat") == "adaptive"
+    # Depth each tensor's chain already has at the anchor it is about to diff
+    # against -- 0 for a tensor that has never left its anchor. Only consulted
+    # under --anchor-policy adaptive; the flat policy has no per-tensor notion
+    # of depth (see graph.py's star-vs-chain note).
+    tensor_anchor_depth: Dict[str, int] = {}
+    if store_full:
+        base_source = None
+    elif adaptive:
+        # This is the chain the flat policy never lets happen: a kept-DELTA
+        # tensor diffs against `base_hash`'s own manifest for it -- the
+        # immediate predecessor, not the deep full commit -- so that if the
+        # policy says DELTA again next commit, the chain actually grows by
+        # one hop rather than re-resolving to the same root every time (which
+        # is what `tensor_anchor` on `base_hash` itself would give: it walks
+        # to the chain's *root*, the number `tensor_anchor_depth` needs, not
+        # the manifest to diff against). A tensor that was individually
+        # promoted at some ancestor is unaffected: its manifest there has no
+        # base, so this loop still finds it via `base_checkpoint`'s own
+        # tensor set, same as any other.
+        base_checkpoint = graph.CommitCheckpoint(store, base_hash)
+        immediate = base_checkpoint.tensor_manifest_hashes()
+        tensor_anchors: Dict[str, str] = {}
+        for name, manifest_hash in immediate.items():
+            _root_hash, depth = graph.tensor_anchor(store, base_hash, name)
+            tensor_anchors[name] = manifest_hash
+            tensor_anchor_depth[name] = depth
+        base_source = CompositeBase(store, tensor_anchors) if tensor_anchors else None
+    else:
+        base_source = graph.CommitCheckpoint(store, anchor)
 
     _t = time.perf_counter()
     alignment, align_result = _align(
@@ -228,6 +344,9 @@ def run(args: argparse.Namespace) -> dict:
     # crash leaves valid reusable chunks rather than a half-written container
     # that has to be discarded -- and `already_have` is a stat, not an index
     # probe.
+    chunk_size_kwargs = (
+        {} if args.chunk_size is None else {"chunk_size_bytes": args.chunk_size}
+    )
     _t = time.perf_counter()
     encoded = encode_checkpoint(
         checkpoint,
@@ -239,12 +358,20 @@ def run(args: argparse.Namespace) -> dict:
         ),
         already_have=lambda content_hash: store.has(content_hash.hex()),
         alignment=alignment,
-        **({} if args.chunk_size is None
-           else {"chunk_size_bytes": args.chunk_size}),
+        **chunk_size_kwargs,
     )
+    if adaptive and not store_full and base_source is not None and encoded.manifests:
+        encoded, full_fallback = _apply_anchor_policy(
+            store, checkpoint, encoded, tensor_anchor_depth, notes,
+            chunk_size_kwargs=chunk_size_kwargs,
+        )
+        if full_fallback:
+            store_full, base_source, alignment = True, None, None
     # Encoding covers reading the checkpoint, subtracting, compressing and
     # writing every chunk object -- the emit callback stores as it goes, so
-    # there is no separate "write chunks" phase to attribute.
+    # there is no separate "write chunks" phase to attribute. The adaptive
+    # re-anchor pass, when it runs, is folded into this same phase rather than
+    # given its own: it is more encoding, just of a subset of tensors.
     timings["encode"] = time.perf_counter() - _t
     _t = time.perf_counter()
 
@@ -275,6 +402,13 @@ def run(args: argparse.Namespace) -> dict:
     timings["total"] = time.perf_counter() - started
 
     original = encoded.original_bytes
+    # Not `encoded.stored_bytes` directly: under --anchor-policy adaptive,
+    # `_apply_anchor_policy` mutates `encoded.per_tensor` in place for any
+    # promoted tensor but cannot revise `stored_bytes` itself (a plain int on
+    # an otherwise-frozen CheckpointResult). Summing per_tensor is always
+    # equal to `stored_bytes` when nothing was promoted, and always correct
+    # when something was -- it is the one place the promotion is visible.
+    stored = sum(s for _, s in encoded.per_tensor.values())
     result = {
         "commit": commit_hash,
         "branch": branch,
@@ -284,8 +418,8 @@ def run(args: argparse.Namespace) -> dict:
         "checkpoint_name": checkpoint.name,
         "tensors": encoded.tensors,
         "original_bytes": original,
-        "residual_bytes": encoded.stored_bytes,
-        "residual_ratio": (encoded.stored_bytes / original) if original else 0.0,
+        "residual_bytes": stored,
+        "residual_ratio": (stored / original) if original else 0.0,
         "deduped_bytes": encoded.deduped_bytes,
         "chunks_new": encoded.chunks_new,
         "chunks_deduped": encoded.chunks_deduped,
@@ -371,6 +505,103 @@ def _align(store, checkpoint: Path, base_source, config_path: Path,
             f"identity: the solved permutation did not reduce the residual"
         )
     return (alignment or None), result
+
+
+def _apply_anchor_policy(
+    store, checkpoint: Path, encoded, tensor_anchor_depth: Dict[str, int],
+    notes: list, *, chunk_size_kwargs: dict,
+):
+    """Second pass of `--anchor-policy adaptive`: promote tensors whose delta
+    against their current anchor is not earning its keep.
+
+    `encoded` is pass 1's result: every tensor already diffed against its
+    per-tensor anchor (`commit.CompositeBase`), which is exactly the
+    measurement `synapsefs.anchor.decide` needs -- `ratio` from
+    `encoded.per_tensor`, `depth` from `tensor_anchor_depth` (the chain length
+    each tensor's anchor already carried, from `graph.tensor_anchor`, plus the
+    hop this commit would add). A tensor whose manifest already has no base
+    (absent from its anchor, or reshaped -- `codec/checkpoint.py`'s own
+    fallback) is left alone; there is nothing to promote it *from*.
+
+    Promoted tensors are re-encoded with `base=None`: stored full, the same
+    as a root commit, with `emit` filtered so only their chunks actually land
+    in the store -- pass 1 already wrote (and orphaned) chunks for these same
+    tensors, which is the same tradeoff the existing full-commit fallback
+    below makes, not a new one.
+
+    `encoded.manifests` and `encoded.per_tensor` are mutated in place for the
+    promoted names (both are plain dicts on an otherwise-frozen dataclass);
+    the caller recomputes `stored_bytes` from the updated `per_tensor` rather
+    than trusting `encoded.stored_bytes`, which pass 1 already computed and
+    this function does not revise. `chunks_new`/`chunks_deduped`/
+    `deduped_bytes` are similarly left at their pass-1 values -- a known,
+    minor inaccuracy in those specific counters after a promotion, traded for
+    not re-deriving chunk-level bookkeeping this function has no other reason
+    to touch.
+
+    Returns `(encoded, full_fallback)`. `full_fallback` is True only when
+    promotion would touch more than `UNUSABLE_TENSOR_FRACTION` of this
+    commit's tensors -- the same reasoning as `UNUSABLE_ANCHOR_FRACTION` one
+    level down: a commit that is mostly re-anchoring is better off as one new
+    hub than a mixed set of per-tensor anchors, and `encoded` is then a fresh
+    result from a whole-checkpoint `base=None` encode. The caller is
+    responsible for setting `store_full`/`base_source`/`alignment` to match.
+    """
+    promote: List[str] = []
+    for name, manifest in encoded.manifests.items():
+        if manifest.get("base_tensor_manifest") is None:
+            continue
+        orig, stored = encoded.per_tensor.get(name, (0, 0))
+        ratio = (stored / orig) if orig else 0.0
+        depth_if_kept = tensor_anchor_depth.get(name, 0) + 1
+        if anchor_policy.decide(ratio, depth_if_kept) is anchor_policy.ANCHOR:
+            promote.append(name)
+
+    if not promote:
+        return encoded, False
+
+    fraction = len(promote) / len(encoded.manifests)
+    if fraction > UNUSABLE_TENSOR_FRACTION:
+        notes.append(
+            f"{len(promote)}/{len(encoded.manifests)} tensors "
+            f"({fraction * 100:.0f}%) need re-anchoring under the adaptive "
+            f"policy; storing this commit in full instead of a mixed anchor set"
+        )
+        full_encoded = encode_checkpoint(
+            checkpoint, None,
+            emit=lambda record: store.put_at(record.content_hash.hex(), record.payload),
+            base_manifests=None,
+            already_have=lambda content_hash: store.has(content_hash.hex()),
+            alignment=None,
+            **chunk_size_kwargs,
+        )
+        return full_encoded, True
+
+    promote_set = set(promote)
+
+    def emit_promoted(record) -> None:
+        if record.tensor in promote_set:
+            store.put_at(record.content_hash.hex(), record.payload)
+
+    reencoded = encode_checkpoint(
+        checkpoint, None,
+        emit=emit_promoted,
+        base_manifests=None,
+        already_have=lambda content_hash: store.has(content_hash.hex()),
+        alignment=None,
+        **chunk_size_kwargs,
+    )
+    for name in promote:
+        if name in reencoded.manifests:
+            encoded.manifests[name] = reencoded.manifests[name]
+            encoded.per_tensor[name] = reencoded.per_tensor.get(
+                name, encoded.per_tensor[name]
+            )
+    notes.append(
+        f"{len(promote)} tensor(s) re-anchored under the adaptive policy "
+        f"(delta ratio at or above tau, or reconstruction depth cap reached)"
+    )
+    return encoded, False
 
 
 def _resolve_config(store, config_path: Path, base_hash: Optional[str]) -> Optional[str]:

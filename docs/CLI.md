@@ -84,6 +84,7 @@ Initialized empty SynapseFS repository in /home/u/myrepo/.synapse (branch: main)
 synapsefs commit <checkpoint.safetensors> -m <message>
                  [--config <config.json>] [--base <ref>]
                  [--no-align] [--chunk-size <bytes>] [--strict]
+                 [--anchor-policy flat|adaptive]
 ```
 
 Ingests a checkpoint, aligns it against the base, stores the residual, writes a commit,
@@ -98,6 +99,7 @@ advances the current branch.
 | `--no-align` | Skip permutation matching; assume identity. Useful for benchmarking (d) in the codec table. |
 | `--chunk-size <bytes>` | Override the default chunk size. |
 | `--strict` | Exit **5** instead of **0** when a tensor is not alignable. |
+| `--anchor-policy flat\|adaptive` | How each tensor picks its diff base. **`flat`** (default): every tensor diffs against the same commit-level anchor, which resets for the whole checkpoint every `REBASE_INTERVAL` commits. **`adaptive`**: each tensor is judged on its own measured drift and may ride a distant anchor, or re-anchor on its own, independently of the others. See ARCHITECTURE.md §4.3.2 — measured 0.79pp smaller on a 24-epoch 90M CNN, at the cost of a second encode pass. |
 
 ### 3.1 Output
 

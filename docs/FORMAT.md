@@ -753,17 +753,34 @@ Two things make the trade worth taking:
 `N = 4` is a placeholder chosen for a bounded worst case, not a measured optimum.
 It lives in exactly one place, `graph.REBASE_INTERVAL`.
 
-**Planned successor: make the interval dynamic.** Rather than a fixed count,
-start a new hub when the group's residuals stop being cheap -- the same signal
-section 9's not-alignable check already computes. A commit whose residual ratio
-jumps, or whose tensors increasingly fall back to `raw-zstd` per section 7, is
-one where the group has drifted far enough that a fresh hub is cheaper than a
-larger residual. That turns re-basing from a schedule into a response to the
-data, and reuses a measurement the alignment stage has to make anyway.
+**Successor, now implemented: a dynamic, per-tensor interval.** Rather than a
+fixed count, start a new hub when residuals stop being cheap. `synapsefs commit
+--anchor-policy adaptive` does this **per tensor** rather than per checkpoint:
+each tensor re-anchors when its own stored/original ratio reaches 0.9 (where a
+delta stops paying for itself), or when its chain would exceed depth 3 (bounding
+reconstruction cost). The statistic is the one this section predicted -- the
+residual ratio, plus the `raw` fallback rate it implies -- measured per tensor
+at encode time.
 
-`OPEN QUESTION` -- the dynamic trigger's exact statistic and threshold. Blocked
-on the same measurements as section 9's not-alignable threshold; until then the
-fixed `N = 4` stands.
+**This needed no format change.** `base_tensor_manifest` is a field of the
+tensor-manifest, not the commit, and reconstruction already recursed through it
+to arbitrary depth, so the depth-1 star was only ever a commit-time policy.
+Repositories written under either policy are the same format and readable by the
+same code; a reader cannot tell which policy wrote a commit, and does not need
+to.
+
+Consequently the star diagram at the top of this section describes
+`--anchor-policy flat` (still the default) exactly, and describes adaptive only
+per tensor: under adaptive, two tensors in the same commit may legitimately have
+different bases, and one tensor's `base_tensor_manifest` chain may be two hops
+deep while its neighbour's is zero. Everything §4.5's reuse rule and §7's
+if-and-only-if invariant say still holds unchanged.
+
+Measured on 24 sequential epochs of a 90M CNN: 63.71% against the flat rule's
+64.50%, with reconstruction depth peaking at 2 and whole-checkpoint restore
+within 2% of flat. See ARCHITECTURE.md §4.3.2 for the numbers and for why the
+saving turns out to come from re-anchor *timing* rather than from per-tensor
+granularity.
 
 ---
 
@@ -773,8 +790,10 @@ fixed `N = 4` stands.
 - [ ] Root-checkpoint encoding: `raw` vs `raw-zstd` (gather cost vs. 24 GB free disk).
 - [ ] Pack dictionary on/off, and dictionary size, measured on real fixtures.
 - [x] Commit topology and re-basing interval — **star, fixed N = 4** (§12A).
-- [ ] Dynamic re-basing trigger to replace the fixed N (§12A), keyed on
-      residual-ratio degradation / `raw-zstd` fallback rate.
+- [x] Dynamic re-basing trigger to replace the fixed N (§12A), keyed on
+      residual-ratio degradation / `raw-zstd` fallback rate — **implemented
+      per tensor** as `--anchor-policy adaptive` (`synapsefs/anchor.py`);
+      opt-in, `flat` remains the default.
 - [ ] Not-alignable threshold, measured against the non-alignable fixture.
 - [ ] Repack trigger / bloom filters if pack count exceeds ~32.
 - [ ] Whether `verify --deep` becomes the default.

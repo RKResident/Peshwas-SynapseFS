@@ -36,7 +36,7 @@ from typing import Dict, Iterator, List, Optional, Protocol, Tuple
 
 import numpy as np
 
-from synapsefs.codec.chunk import FLOAT, SINT, dtype_spec, to_monotone_key
+from synapsefs.codec.chunk import FLOAT, SINT, dtype_spec
 from synapsefs.errors import IntegrityError
 from synapsefs.safetensors_io import TensorSpec
 from synapsefs.store.atomic import atomic_writer
@@ -232,16 +232,11 @@ class TensorComparison:
     """How one tensor in two checkpoints relates.
 
     `max_ulp_diff` is the interesting column for a lossless-codec check and
-    deserves an explanation. It reuses `to_monotone_key` from the codec: that
-    map turns a float's bit pattern into an integer that sorts in the same
-    order as the float, so the *integer* distance between two keys is exactly
-    the number of representable values between them -- the ULP distance. It is
-    the scale-free way to say "these differ by one bit in the mantissa"
-    without picking an epsilon that means different things at 1e-8 and 1e+8.
-
-    For a correct reconstruction every one of these is zero, and that is the
-    point: the codec's claim is bit-equality, so a report of "max abs diff
-    1e-7" would already be a bug rather than a rounding artifact.
+    deserves an explanation. It is the raw-bit-pattern distance between two
+    values, read as an unsigned integer -- for a correct reconstruction it is
+    always zero, since the codec's claim is bit-equality, not closeness. A
+    report of "max abs diff 1e-7" would already be a bug, not a rounding
+    artifact, which is why this compares bits rather than floats.
     """
 
     name: str
@@ -279,18 +274,28 @@ def _as_float(bits: np.ndarray, dtype: str) -> np.ndarray:
 
 
 def _ulp_gap(left: np.ndarray, right: np.ndarray, dtype: str) -> int:
-    """Largest ULP distance between two batches of raw bit patterns.
+    """Largest raw-bit-pattern distance between two batches of bit patterns.
 
-    Skipped for 8-byte dtypes: their monotone keys span the full uint64 range,
-    so the subtraction has nowhere to widen into. Integers have no meaningful
-    ULP anyway -- `max_abs_diff` already says everything for I64.
+    Plain integer subtraction of the widened bit patterns, the same
+    modular-subtraction approach the codec's own delta step uses (see
+    `codec/chunk.py`'s note on dropping the monotone key from the encode
+    path): no per-dtype key derivation, at the cost of not staying monotone
+    across the sign boundary the way a true ULP distance would. That is an
+    acceptable trade here -- this number exists to catch "this codec is not
+    actually lossless" (where it is always zero for a correct
+    reconstruction), not to rank near-misses by perceptual closeness.
+
+    Skipped for 8-byte dtypes: the widened patterns already span the full
+    int64 range, so the subtraction has nowhere to widen into. Integers have
+    no meaningful ULP anyway -- `max_abs_diff` already says everything for
+    I64.
     """
     width, kind = dtype_spec(dtype)
     if width > 4 or kind not in (FLOAT, SINT):
         return 0
-    lk = to_monotone_key(np.ascontiguousarray(left).reshape(-1), kind).astype(np.int64)
-    rk = to_monotone_key(np.ascontiguousarray(right).reshape(-1), kind).astype(np.int64)
-    gap = np.abs(lk - rk)
+    lb = np.ascontiguousarray(left).reshape(-1).astype(np.int64)
+    rb = np.ascontiguousarray(right).reshape(-1).astype(np.int64)
+    gap = np.abs(lb - rb)
     return int(gap.max()) if gap.size else 0
 
 

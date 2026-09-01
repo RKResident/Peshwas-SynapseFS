@@ -67,6 +67,7 @@ __all__ = [
     "REBASE_INTERVAL",
     "commits_since_full",
     "nearest_full_ancestor",
+    "tensor_anchor",
     "canonical_json",
     "put_json",
     "get_json",
@@ -253,6 +254,49 @@ def nearest_full_ancestor(store: ObjectStore, commit_hash: Optional[str]) -> Opt
     return None
 
 
+def tensor_anchor(
+    store: ObjectStore, commit_hash: str, name: str
+) -> Tuple[Optional[str], int]:
+    """The tensor-manifest `name` bottoms out at from `commit_hash`, and how
+    many residual hops away it is.
+
+    This is `nearest_full_ancestor`, but at tensor-manifest granularity
+    instead of commit granularity. It costs nothing new on disk: a tensor's
+    manifest already names the manifest it was diffed against
+    (`base_tensor_manifest`, FORMAT.md section 7), so this is a pure walk of
+    objects the checkpoint already has to read. No commit is visited at all
+    -- a tensor byte-identical across several commits is collapsed by the
+    FORMAT.md 4.5 reuse rule into one manifest that several checkpoint-
+    manifests point at, so walking commits would either double-count that
+    span or need special-casing it; walking the manifest chain does neither.
+
+    Returns `(None, 0)` if `name` is not in this commit's checkpoint at all --
+    the caller is expected to treat that as "no tensor here", not "found the
+    anchor at depth 0" (a manifest with no base also returns depth 0, and the
+    two must not be confused).
+
+    depth 0 means the manifest itself has no base (it holds full data, or was
+    reused verbatim from one that does): nothing to walk. depth *k* means *k*
+    delta hops separate this commit's copy of `name` from the manifest that
+    actually holds its bytes.
+    """
+    commit = get_json(store, commit_hash)
+    manifest = get_json(store, commit["checkpoint_manifest"])
+    tensor_manifests: Dict[str, str] = manifest["tensors"]
+    if name not in tensor_manifests:
+        return None, 0
+
+    manifest_hash = tensor_manifests[name]
+    depth = 0
+    while True:
+        tensor_manifest = get_json(store, manifest_hash)
+        base_hash = tensor_manifest.get("base_tensor_manifest")
+        if base_hash is None:
+            return manifest_hash, depth
+        manifest_hash = base_hash
+        depth += 1
+
+
 def walk_first_parent(
     store: ObjectStore, commit_hash: Optional[str], *, limit: Optional[int] = None
 ) -> List[Tuple[str, dict]]:
@@ -378,6 +422,34 @@ class CommitCheckpoint:
         self.manifest = get_json(store, self.commit["checkpoint_manifest"])
         self._tensor_manifests: Dict[str, str] = self.manifest["tensors"]
         self._cache: Dict[str, dict] = {}
+
+    @classmethod
+    def from_manifest(
+        cls, store: ObjectStore, name: str, manifest_hash: str
+    ) -> "CommitCheckpoint":
+        """A single-tensor view rooted directly at a tensor-manifest, bypassing
+        the commit and checkpoint-manifest layers.
+
+        `synapsefs.anchor`'s per-tensor policy discovers a tensor's current
+        anchor as a manifest hash (via `tensor_anchor`, which follows
+        `base_tensor_manifest` links rather than commits) -- there may be no
+        single commit that names it, since a tensor's own anchor and the
+        checkpoint's commit-level anchor can diverge once tensors are promoted
+        individually. This constructor is what lets `commit.CompositeBase`
+        read from that manifest anyway: every method below reads through
+        `self._tensor_manifests` and `self.store`, neither of which cares
+        whether `self.commit`/`self.manifest` were ever populated, so nothing
+        needs duplicating -- only `header_bytes` and `total_size` assume a
+        real commit, and a per-tensor base source never calls either.
+        """
+        self = cls.__new__(cls)
+        self.store = store
+        self.commit_hash = None
+        self.commit = None
+        self.manifest = None
+        self._tensor_manifests = {name: manifest_hash}
+        self._cache = {}
+        return self
 
     # -- the SafetensorsFile-shaped surface --------------------------------
 
