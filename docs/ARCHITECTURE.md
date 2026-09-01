@@ -59,10 +59,10 @@ Everything else follows from defending that guarantee cheaply:
 | PS module | grade | state |
 |---|---|---|
 | 1 Alignment & compression | 25% | codec done; aligner **wired in** (§8); scaling measured to n=10,000 at 100% recovery (§4.6.3) |
-| 2 Filesystem (FUSE) | 25% | run live: mounts, lists, and reads back byte-identical for full and residual commits at 206 MiB/s (§4.4.1). `forget()` and the inode index were also missing |
+| 2 Filesystem (FUSE) | 25% | done; runs live — mounts, lists, and reads back byte-identical for full and residual commits at 206 MiB/s (§4.4.1). `forget()` and the `(parent, name)` inode index are in |
 | 3 Cryptographic integrity | 20% | done (tiers to be re-based on §4.5.2) |
-| 4 Networking & CLI | 15% | CLI complete incl. `merge`; `push`/`pull`/`serve` exist outside this tree, not merged in yet |
-| 5 Documentation | 15% | this + `PRIMER.md` + `FORMAT.md` + `CLI.md`; **no README yet** |
+| 4 Networking & CLI | 15% | CLI complete incl. `merge`; `push`/`pull`/`serve` merged in |
+| 5 Documentation | 15% | this + `PRIMER.md` + `FORMAT.md` + `CLI.md` + `README.md` |
 
 **Architecture scope.** Only BatchNorm, LayerNorm, convolution and dense layers
 need supporting. Attention, embeddings and LoRA are out of scope, which is why
