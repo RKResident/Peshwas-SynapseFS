@@ -2,7 +2,7 @@
 
 **Permutation-aware, cryptographically verifiable version control and virtual filesystem for neural network checkpoints.**
 
-SynapseFS is a purpose-built version control system and virtual file system designed specifically for machine learning models stored in `.safetensors` format. It solves the massive storage and bandwidth overheads of deep learning checkpoints by combining **Git Re-Basin permutation alignment**, **lossless integer-domain residual codecs**, **content-addressed packfile storage**, and a **read-only POSIX FUSE engine** that serves arbitrary checkpoints on demand with zero disk pre-materialization.
+SynapseFS is a purpose-built version control system and virtual file system designed specifically for machine learning models stored in `.safetensors` format. It solves the massive storage and bandwidth overheads of deep learning checkpoints by combining **Git Re-Basin permutation alignment**, **lossless integer-domain residual codecs**, **content-addressed object storage**, and a **read-only POSIX FUSE engine** that serves arbitrary checkpoints on demand with zero disk pre-materialization.
 
 ---
 
@@ -123,7 +123,7 @@ Trust is rooted at locally accepted branch references (`refs/heads/*`):
   ```
 - **On-Demand Slicing**: Converts arbitrary `pread(offset, size)` system calls into header byte slices and intersecting tensor row ranges.
 - **Async Trio Loop & Worker Offloading**: `pyfuse3` single-threaded event loop delegates heavy zstd decompressions to worker threads (`trio.to_thread.run_sync`), preventing POSIX reader stalls.
-- **LRU Chunk Cache**: Thread-safe byte-capped memory cache (`--cache-size`, default 512 MiB) prevents RSS blowup under concurrent read patterns.
+- **LRU Chunk Cache**: Thread-safe byte-capped memory cache (`--cache-size`, default 32 MiB) prevents RSS blowup under concurrent read patterns.
 - **Non-Root Access**: Fully functional in user space without `sudo` (mounts on any user-owned directory).
 
 ---
@@ -134,11 +134,7 @@ Trust is rooted at locally accepted branch references (`refs/heads/*`):
 .synapse/
 ├── objects/
 │   ├── tmp/                          # Ephemeral staging directory (cleaned on startup)
-│   ├── <hh>/<hash>                   # Loose objects (commits, manifests, headers, permutations)
-│   └── pack/
-│       ├── pack-<hash>.pack          # Sealed chunk packfiles
-│       ├── pack-<hash>.idx           # Fanout binary indices
-│       └── order                     # Newest-first pack search order
+│   └── <hh>/<cd>/<hash>              # Loose objects (commits, manifests, headers, permutations, chunks)
 ├── refs/
 │   └── heads/<branch>                # Branch head tip (text file holding 64-char commit hash)
 └── HEAD                              # Symbolic ref ("ref: refs/heads/main") or detached commit hash
@@ -257,10 +253,35 @@ Every step below was verified from an empty virtualenv on a clean interpreter.
 
 ### Prerequisites
 
-**Python 3.11 or newer.** Ubuntu 22.04 ships 3.10 as `python3`, which `pip`
-rejects outright (`Package 'synapsefs' requires a different Python`). Check with
-`python3 -V` and use `python3.12`/`python3.13`/`python3.14` explicitly if the
-default is older.
+**Python 3.11 or newer.** SynapseFS is developed and tested on **3.14**.
+
+Check what your `python3` actually is before anything else:
+
+```bash
+python3 -V
+```
+
+Ubuntu 22.04 ships **3.10**, and `python3 -m venv` inherits that -- so the venv
+is built on 3.10 and pip rejects the package with:
+
+```
+ERROR: Package 'synapsefs' requires a different Python: 3.10.12 not in '>=3.11'
+```
+
+If `python3 -V` reports anything below 3.11, name the interpreter explicitly
+when creating the venv (`python3.14 -m venv .venv`). Install one first if you
+have none: `sudo apt install python3.14 python3.14-venv python3.14-dev`, or via
+`pyenv` / the deadsnakes PPA.
+
+Whichever interpreter you pick, **its** `-dev` package is the one you need --
+having `python3.10-dev` installed does not help a 3.14 venv. A version that is
+on `PATH` but has no headers fails later at the compile step, not at venv
+creation, so it is worth checking up front:
+
+```bash
+python3.14 -c "import sysconfig, os; p = sysconfig.get_paths()['include']; \
+print(p, os.path.exists(os.path.join(p, 'Python.h')))"
+```
 
 **System packages.** Two extension modules are compiled during install --
 `pyfuse3` and this project's own Cython codec kernel -- so a compiler and
@@ -293,10 +314,10 @@ back to portable C and everything still works, just slower on the unshuffle.
 ### 1. Installation
 
 ```bash
-git clone https://github.com/Peshwas-SynapseFS/Peshwas-SynapseFS.git
+git clone https://github.com/RKResident/Peshwas-SynapseFS (Or an extracted zip)
 cd Peshwas-SynapseFS
 
-python3.12 -m venv .venv          # or any interpreter >= 3.11
+python3.14 -m venv .venv          # NOT `python3` unless it is >= 3.11
 source .venv/bin/activate
 
 pip install -e .

@@ -265,6 +265,10 @@ differently and dedup breaks.
 
 ## 5. Packfile — `pack-<hash>.pack`
 
+> **Tried and abandoned.** Not implemented. Objects are stored loose, one file
+> per hash (§3). Kept here as a record of the format that was specified.
+
+
 ```
 +========== HEADER (52 bytes) ==========+
 | 0   8   magic       "SYNPACK\0"       |
@@ -291,6 +295,9 @@ differently and dedup breaks.
 ---
 
 ## 6. Pack index — `pack-<hash>.idx`
+
+> **Tried and abandoned.** See §5.
+
 
 Designed to be `mmap`ed and binary-searched in place.
 
@@ -335,14 +342,25 @@ Multi-pack: probe each mmapped `.idx` in `objects/pack/order` sequence (newest f
 
 `encoding` in a tensor-manifest chunk entry selects the decode path.
 
-| `encoding` | Payload is | Decode |
-|---|---|---|
-| `raw` | Uncompressed tensor bytes for the row range | memcpy |
-| `raw-zstd` | zstd frame over tensor bytes | zstd decompress |
-| `delta-zigzag-zstd` | zstd frame over zigzag-varint deltas | §7.1 |
+| `encoding` | Payload is | Needs a base | Decode |
+|---|---|---|---|
+| `raw` | Uncompressed tensor bytes for the row range | no | memcpy |
+| `raw-zstd` | zstd frame over tensor bytes | no | zstd |
+| `raw-shuffle-zstd` | zstd frame over byte-shuffled tensor bytes | no | zstd, unshuffle |
+| `delta-shuffle-zstd` | zstd frame over byte-shuffled residual | yes | zstd, unshuffle, add base |
+| `delta-zigzag-escape-zstd` | zstd frame over an escaped zigzag residual | yes | §7.3 |
+| `delta-zigzag-zstd` | zstd frame over zigzag-varint deltas | yes | §7.1 — decode only, not written |
 
-If the pack's `flags` bit 0 is set, zstd frames were compressed with the dictionary at
-`dict_hash` and must be decompressed with it.
+**Byte shuffle.** `shuffle` groups byte 0 of every element, then byte 1, and so
+on, so the near-constant high bytes of a 16-bit float form one long run that
+zstd can compress. `unshuffle` is its exact inverse. `width` always divides the
+stream length, since a stream is a whole number of elements.
+
+**Content hash.** For the shuffled encodings the hash covers the *shuffled*
+stream — the shuffle happens before hashing.
+
+Dictionary-compressed frames belonged to the packfile format (§5) and are not
+written; every zstd frame is self-contained.
 
 ### 7.1 `delta-zigzag-zstd`
 
@@ -388,6 +406,30 @@ Round-trip verified bit-exact. Note element 3: `-0.0` maps to key 32767 with del
 and reconstructs as `0x8000`, not `0x0000`.
 
 ---
+
+### 7.3 `delta-zigzag-escape-zstd`
+
+Residual = `key(B) - key(A)` zigzagged, exactly as in §7.1, then packed into two
+planes so that most elements cost one byte instead of two.
+
+```
+[u64 LE narrow_len][narrow plane][shuffled wide plane]
+```
+
+- **narrow plane** — `narrow_len` bytes, one per element: the zigzag value if it
+  is `< 255`, otherwise the marker `255`.
+- **wide plane** — every escaped value in order, as `<u2`, byte-shuffled (§7).
+
+Both planes are compressed as a single zstd frame; the content hash covers that
+one contiguous stream.
+
+**Decode:** zstd → read `narrow_len` → unshuffle the wide plane → substitute the
+wide values back at each `255` marker → un-zigzag → `key(B) = delta + key(A)` →
+invert `key()`.
+
+Chosen per chunk only when under half the elements escape: an element costs 1
+byte when it fits and 3 when it does not, so the mean is `3 - 2p` for a fitting
+fraction `p`, which drops below the 2 bytes of a plain residual at `p = 0.5`.
 
 ## 8. `refs/` and `HEAD`
 
