@@ -253,7 +253,10 @@ Every step below was verified from an empty virtualenv on a clean interpreter.
 
 ### Prerequisites
 
-**Python 3.11 or newer.** SynapseFS is developed and tested on **3.14**.
+**Python 3.11 or newer.** Verified on **3.13** and **3.14**; 3.11 and 3.12 meet
+the declared floor but are not part of what we test. Nothing in the source needs
+a modern interpreter -- the constraint is `requires-python` in `pyproject.toml`,
+which pip enforces strictly.
 
 Check what your `python3` actually is before anything else:
 

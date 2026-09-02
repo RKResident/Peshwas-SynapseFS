@@ -6,6 +6,9 @@ import argparse
 import subprocess
 from pathlib import Path
 
+from synapsefs.errors import NetworkError, UsageError
+from synapsefs.store.repo import Repo
+
 
 def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
     parser = subparsers.add_parser(
@@ -29,32 +32,55 @@ def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> dict:
-    current_dir = Path(__file__).resolve().parent
-    spp_path = current_dir.parent.parent / "networking/spp"
+    # `spp` resolves every path relative to its working directory --
+    # `objects/...`, `refs/heads/...` -- so it has to run inside `.synapse/`.
+    # Locating the repo here means the user runs this from the working tree,
+    # like every other subcommand, instead of having to cd into `.synapse`
+    # first. Without it the peer reports a filesystem error and the reason
+    # ("Cannot open file refs/heads/main") is buried in the child's stderr.
+    repo = Repo.find(args.repo)
+    spp_path = Path(__file__).resolve().parent.parent.parent / "networking/spp"
+    if not spp_path.is_file():
+        raise UsageError(
+            f"transfer helper not built: {spp_path} is missing. Run `make network`."
+        )
 
     process = subprocess.Popen(
         [str(spp_path), "push", args.ip, args.port, args.branch],
+        cwd=str(repo.synapse_dir),
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        # Merged so the child's diagnostics interleave in order and neither
+        # pipe can fill while the other is being drained.
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
 
+    lines = []
     for line in process.stdout:
         print(line, end="")
-
-    for line in process.stderr:
-        print(line, end="")
+        lines.append(line.rstrip("\n"))
+    code = process.wait()
+    if code != 0:
+        # CLI.md 1.3 reserves 7 for transport failures. Without this the
+        # wrapper returned a dict carrying the failure and still exited 0, so
+        # `synapsefs push ... && next-step` treated a refused connection as
+        # success.
+        raise NetworkError(
+            f"push failed (spp exit {code})"
+            + (f": {lines[-1]}" if lines else "")
+        )
 
     return {
+        "ip": args.ip,
         "port": args.port,
-        "result": process.stdout,
-        "error_code": process.stderr
+        "branch": args.branch,
+        "repo": str(repo.root),
+        "output": lines,
+        "exit_code": code,
     }
 
+
 def format_human(result: dict) -> str:
-    """Matches CLI.md ~7's worked example on the success path."""
-    string = ""
-    string += f"Serving on port {result['port']}\n"
-    string += f"Output: {result['result']}"
-    return string
+    return (f"Pushed '{result['branch']}' from {result['repo']} "
+            f"to {result['ip']}:{result['port']}")
