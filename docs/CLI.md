@@ -83,7 +83,7 @@ Initialized empty SynapseFS repository in /home/u/myrepo/.synapse (branch: main)
 ```
 synapsefs commit <checkpoint.safetensors> -m <message>
                  [--config <config.json>] [--base <ref>]
-                 [--no-align] [--chunk-size <bytes>] [--strict]
+                 [--no-align] [--chunk-size <bytes>] [--strict] [--timing]
                  [--anchor-policy flat|adaptive]
 ```
 
@@ -97,8 +97,9 @@ advances the current branch.
 | `--config <config.json>` | Topology. Defaults to `config.json` beside the checkpoint. Required for the first commit; reused from the base commit afterward if omitted. |
 | `--base <ref>` | Base to diff against. Default: current `HEAD`. Ignored on the root commit. |
 | `--no-align` | Skip permutation matching; assume identity. Useful for benchmarking (d) in the codec table. |
-| `--chunk-size <bytes>` | Override the default chunk size. |
+| `--chunk-size <bytes>` | Override the default chunk size (1 MiB). |
 | `--strict` | Exit **5** instead of **0** when a tensor is not alignable. |
+| `--timing` | Report wall-clock per phase (align, encode, write). |
 | `--anchor-policy flat\|adaptive` | How each tensor picks its diff base. **`flat`** (default): every tensor diffs against the same commit-level anchor, which resets for the whole checkpoint every `REBASE_INTERVAL` commits. **`adaptive`**: each tensor is judged on its own measured drift and may ride a distant anchor, or re-anchor on its own, independently of the others. See ARCHITECTURE.md §4.3.2 — measured 0.79pp smaller on a 24-epoch 90M CNN, at the cost of a second encode pass. |
 
 ### 3.1 Output
@@ -281,13 +282,13 @@ report, since diffing two genuinely different checkpoints is a legitimate use.
 ## 7. `verify`
 
 ```
-synapsefs verify [<ref>] [--shallow | --fast | --deep] [--content] [--packs]
+synapsefs verify [<ref>] [--shallow | --fast | --deep] [--content]
                  [--all] [--json]
 ```
 
 Walks and cryptographically verifies lineage. **Independent of `checkout` and
 `mount`** so integrity can be graded standalone — it talks to the object store
-and pack set directly, and works on a repo whose FUSE mount is broken or absent.
+directly, and works on a repo whose FUSE mount is broken or absent.
 
 Walks **every parent**, not first-parent only (PS 2f/2g): a merge's second
 parent is reachable history whose corruption is just as fatal. A visited set
@@ -323,30 +324,39 @@ attacker controls as fully as the payload.
 
 ### 7.2 Tiers
 
+Each tier is a superset of the one above it. `--deep` is the default.
+
 | Tier | Adds | Detects |
 |---|---|---|
-| `--shallow` | Loose objects re-hashed against the hash their parent named; every chunk reference probed for existence | Structural corruption, broken links |
-| `--fast` | + each chunk's stored payload vs the index's 8-byte checksum. No decompression | **Bit-rot only** |
-| *(default)* `--deep` | + decompress each chunk, re-hash against `chunks[].object` | **Malicious block injection** |
-| `--content` | + reconstruct each tensor, check its manifest `content_hash` | A permutation applied in the wrong order |
+| `--shallow` | Re-hash every loose object against the hash its parent named; probe that every chunk exists. Touches no payload. | Structural corruption, broken links, missing objects |
+| `--fast` | + each chunk's stored bytes against the `stored_checksum` its tensor-manifest records. No decompression. | Bit-rot, and substitution — the checksum is ref-anchored |
+| `--deep` *(default)* | + decompress every chunk and re-hash it against the hash its tensor-manifest names | Malicious block injection |
+| `--content` | + reconstruct every tensor and check it against its manifest's `content_hash` | A permutation applied in the wrong order |
 
-**`--deep` is the default**, departing from this document's earlier table which
-defaulted to the checksum tier. PS 2b asks specifically that malicious block
-injection be rejected, and the checksum tier structurally cannot do it. Measured
-on a 25-commit / 152 MiB history the difference is 0.19 s → 0.54 s; that is not
-a price worth paying to ship a default that detects no tampering.
-
-`--content` is separate rather than folded into `--deep` because it is the only
-check requiring *reconstruction* — a residual chunk must be applied to its base.
-Deep hashes the decompressed stream instead, so it needs no base and stays
-O(stored bytes). Costs ~4× deep.
-
-`--packs` re-hashes each pack file against its own trailer. Off by default: at
-the deep tier every *referenced* byte is already checked against a stronger,
-ref-anchored hash, so this only covers framing and unreferenced regions — at the
-cost of doubling read volume.
+`--content` is a separate flag rather than part of `--deep` because it is the
+only check that requires *reconstruction* — a residual chunk has to be applied
+to its base. Deep hashes the decompressed stream instead, so it needs no base
+and stays O(stored bytes).
 
 `--all` verifies every branch rather than `<ref>`'s ancestry.
+
+#### Cost
+
+25 commits, 6075 chunks, 3.4 GiB of stored objects, cold page cache:
+
+| Tier | Cold | Warm | Payload rate | Peak RSS |
+|---|---|---|---|---|
+| `--shallow` | 1.10 s | 0.92 s | — (reads no payload) | 85 MB |
+| `--fast` | 8.27 s | 8.14 s | 503.7 MiB/s | 86 MB |
+| `--deep` | 13.54 s | 13.44 s | 293.5 MiB/s | 87 MB |
+| `--deep --content` | 32.89 s | 35.90 s | 116.8 MiB/s | 127 MB |
+
+`--content` costs about 2.5× `--deep`. Memory is flat across the first three
+tiers — verification streams chunk by chunk and never holds a checkpoint — and
+rises only for `--content`, which materialises one tensor at a time.
+
+Cold and warm are close because the work is CPU-bound (hashing and
+decompression), not I/O-bound.
 
 ### 7.3 Output
 
@@ -520,7 +530,7 @@ Read-only POSIX mount. Daemonizes unless `--foreground`.
 | Flag | Default | Notes |
 |---|---|---|
 | `--ref` | all branches | Restrict the namespace to one ref |
-| `--cache-size` | `OPEN QUESTION` | Hard cap on the decoded-chunk cache. Drives the peak-RSS metric — must be tunable for the benchmark curve. |
+| `--cache-size` | 32 MiB | Hard cap on the decoded-chunk cache. Size it by the number of distinct checkpoints read at once, roughly 64 MiB each. |
 | `--allow-other` | off | Requires `user_allow_other` in `/etc/fuse.conf` |
 | `--debug-fuse` | off | FUSE protocol tracing |
 
@@ -534,7 +544,7 @@ Namespace:
 
 ```
 $ synapsefs mount /mnt/syn
-Mounted /home/u/repo at /mnt/syn (read-only, cache 512 MiB)
+Mounted /home/u/repo at /mnt/syn (read-only, cache 32 MiB)
 
 $ python -c "from safetensors.torch import load_file; load_file('/mnt/syn/main/model.safetensors')"
 $ synapsefs unmount /mnt/syn
@@ -562,7 +572,6 @@ synapsefs bench <fixture-dir>             # run the graded benchmark suite
 
 ## 13. Open questions
 
-- [ ] Default `--cache-size` for `mount` (needs the RSS/throughput curve).
 - [ ] Merge conflict semantics (§8).
 - [ ] Whether `verify --deep` becomes the default (§7).
 - [ ] Working-tree filename: recorded per commit, or fixed at `init`?
