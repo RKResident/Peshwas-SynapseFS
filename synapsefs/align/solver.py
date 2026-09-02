@@ -15,6 +15,7 @@ applies them once, during subtraction.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from dataclasses import dataclass, field
@@ -23,10 +24,69 @@ import numpy as np
 
 from .coordinate_descent import DEFAULT_MAX_SWEEPS, DescentResult, descend
 from .IR import GroupId, Topology
-from .objective import MatrixPair, apply_col_perm, apply_row_perm
+from .objective import (MatrixPair, apply_col_perm, apply_row_perm,
+                        as_matrix)
 from .reader import SafetensorsReader
 from .residual import (NOT_ALIGNABLE_THRESHOLD, Assessment, assess,
-                       group_helped, summarize)
+                       group_helped, relative_residual, summarize)
+
+
+#: BLAS threads to use for the cost-matrix GEMMs.
+#:
+#: The products are tall-and-skinny -- [1792, 12096] @ [12096, 1792] on the 90M
+#: benchmark -- and do not scale the way a square GEMM would. Measured on a
+#: 24-core box, one alignment:
+#:
+#:     1 thread   14.62s      8 threads   6.47s  (2.26x)
+#:     2 threads  10.83s     24 threads   6.75s  (2.17x)
+#:
+#: Past eight, coordination costs more than the extra cores return, so letting
+#: OpenBLAS default to one thread per core is actively slower than capping it.
+#: An explicit OMP/OpenBLAS setting in the environment still wins: this only
+#: applies when the caller has expressed no preference.
+DEFAULT_BLAS_THREADS = 8
+
+#: Skip solving a group whose members have barely moved.
+#:
+#: Consecutive checkpoints are almost always identity, and proving that costs a
+#: full cost matrix per group -- 82% of an alignment -- to produce no output.
+#: This gate asks the cheaper question first: has this group's weight actually
+#: changed enough for any permutation to pay for itself?
+#:
+#: The number is measured, not guessed. Per-group numel-weighted
+#: ||T - B|| / ||T||, over epochs 1->2 and 3->4 of the 90M benchmark, against
+#: the same pairs with one group's rows deliberately permuted:
+#:
+#:     identity groups     max  0.4877
+#:     permuted groups     min  1.4491      (~sqrt(2), the uncorrelated value)
+#:
+#: 0.8 sits 1.6x above the highest identity group and 1.8x below the lowest
+#: permuted one. The gate is per GROUP, not global: a global mean does not
+#: separate (a permuted 896-unit group scores 0.4608 against 0.4461 for a
+#: genuinely identical pair), because one moved group is diluted by eleven
+#: still ones.
+#:
+#: This is a heuristic and it is allowed to be: a gated group is left at
+#: identity, which is what `_reject_unhelpful` would almost certainly have
+#: done with its permutation anyway. Pass `identity_gate=None` to disable.
+DEFAULT_IDENTITY_GATE = 0.8
+
+
+def _blas_limit(threads: int = DEFAULT_BLAS_THREADS):
+    """Cap BLAS threads for the duration of a block, if threadpoolctl is here.
+
+    Optional dependency, and a no-op without it -- the alignment is correct
+    either way, just slower. Honours an explicit OMP_NUM_THREADS /
+    OPENBLAS_NUM_THREADS rather than overriding what the caller asked for.
+    """
+    if any(os.environ.get(v) for v in
+           ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")):
+        return contextlib.nullcontext()
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return contextlib.nullcontext()
+    return threadpool_limits(limits=threads, user_api="blas")
 
 
 @dataclass
@@ -56,6 +116,9 @@ class AlignmentResult:
     sweeps: int = 0
     converged: bool = True
     unsolved_groups: list[GroupId] = field(default_factory=list)
+    #: Groups skipped by the identity gate: their weights had barely moved, so
+    #: no permutation could have paid for itself and none was solved for.
+    gated_groups: list[GroupId] = field(default_factory=list)
     #: Groups the solver permuted but whose permutation did not reduce the
     #: residual, so it was dropped and every member left at identity.
     #: Distinct from `unsolved_groups`: those could not be solved at all.
@@ -139,11 +202,49 @@ def _unusable(topo: Topology, base_shapes, target_shapes) -> set[GroupId]:
     return out
 
 
-def _aligned_base(base: np.ndarray, a: TensorAlignment) -> np.ndarray:
+def _aligned_base(base: np.ndarray, a: TensorAlignment) -> "np.ndarray | None":
+    """The base as this alignment would gather it, or None for identity.
+
+    None rather than `base` unchanged: `assess` reuses `pre` as `post` when the
+    aligned base is None, and returning the array instead made it recompute an
+    identical float64 norm over every tensor. On the identity path -- which is
+    the common one -- that was half of the residual pass and 1.15x on the
+    whole alignment.
+    """
+    if a.pi_row is None and a.pi_col is None:
+        return None
     out = apply_row_perm(base, a.pi_row)
     if a.pi_col is not None and out.ndim > 1:
         out = apply_col_perm(out, a.pi_col, a.col_block_size)
     return out
+
+
+def _group_pre_residual(topo: Topology, gid: GroupId, src) -> float:
+    """numel-weighted ||T - B|| / ||T|| over a group's row members.
+
+    Weighted by element count for the same reason `group_bit_delta` is: by
+    count, a handful of BatchNorm buffers outvote the convolution kernel they
+    belong to. Returns inf for anything unmeasurable, which leaves the group
+    ungated and solved normally -- the gate may only ever skip work it is
+    confident about.
+    """
+    g = topo.groups.get(gid)
+    if g is None or g.is_empty:
+        return float("inf")
+    num = den = 0.0
+    for name in g.row_members:
+        try:
+            t, b = as_matrix(src.target(name)), as_matrix(src.base(name))
+        except (KeyError, ValueError):
+            return float("inf")
+        if t.shape != b.shape:
+            return float("inf")
+        r = relative_residual(t, b)
+        if not np.isfinite(r):
+            return float("inf")
+        num += r * t.size
+        den += t.size
+    return num / den if den else float("inf")
 
 
 def _members(topo: Topology, gids) -> set[str]:
@@ -226,6 +327,8 @@ def align_checkpoints(base, target, topo: Topology, *,
                       no_align: bool = False,
                       max_sweeps: int = DEFAULT_MAX_SWEEPS,
                       threshold: float = NOT_ALIGNABLE_THRESHOLD,
+                      identity_gate: "float | None" = DEFAULT_IDENTITY_GATE,
+                      blas_threads: int = DEFAULT_BLAS_THREADS,
                       measure: bool = True,
                       on_sweep=None) -> AlignmentResult:
     """Solve, fan out, and measure. base/target are paths, readers, or dicts."""
@@ -245,12 +348,25 @@ def align_checkpoints(base, target, topo: Topology, *,
                                            for g in topo.solvable_groups()},
                                     seed=seed)
         else:
-            descent = descend(topo, src, max_sweeps=max_sweeps, seed=seed,
-                              skip=unusable, on_sweep=on_sweep)
+            skip = set(unusable)
+            if identity_gate is not None:
+                # Cheapest question first: has this group moved enough for any
+                # permutation to be worth solving for? Reading both sides here
+                # warms MatrixPair's cache for whatever is solved afterwards,
+                # so the gate is close to free on the groups it does not skip.
+                gated = {g.id for g in topo.solvable_groups()
+                         if g.id not in skip
+                         and _group_pre_residual(topo, g.id, src) < identity_gate}
+                res.gated_groups = sorted(gated)
+                skip |= gated
+            with _blas_limit(blas_threads):
+                descent = descend(topo, src, max_sweeps=max_sweeps, seed=seed,
+                                  skip=skip, on_sweep=on_sweep)
         res.groups = len(topo.groups)
         res.sweeps = descent.sweeps
         res.converged = descent.converged
-        res.unsolved_groups = list(descent.unsolved)
+        res.unsolved_groups = [g for g in descent.unsolved
+                               if g not in set(res.gated_groups)]
 
         names = list(target_shapes)
         res.tensors = plan(topo, descent.perms, names)

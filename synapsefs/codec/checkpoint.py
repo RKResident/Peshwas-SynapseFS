@@ -84,11 +84,35 @@ __all__ = [
 
 PathLike = Union[str, "os.PathLike[str]"]
 
-# OPEN QUESTION 1.2 (docs/OPEN_QUESTIONS.md) -- not benchmarked yet. Target is
-# ~1-4 MB post-compression per FORMAT.md section 7; 4 MiB is the top of that
-# range, picked as a placeholder, not a measured default. Whoever closes
-# OPEN QUESTION 1.2 should update this constant and cite the benchmark here.
-DEFAULT_CHUNK_SIZE_BYTES = 4 * 1024 * 1024
+# OPEN QUESTION 1.2 (docs/OPEN_QUESTIONS.md) -- CLOSED, measured.
+#
+# The chunk is the unit of decoding, so its size is not a storage parameter,
+# it is the READ path's granularity: a 4 KiB page fault from a memory-mapped
+# reader costs one whole chunk decode plus the base chunk it is a delta
+# against. At 4 MiB that is a 2048:1 mismatch, and the resulting decode churn
+# -- not the bounded chunk cache -- is what sets the daemon's peak RSS.
+#
+# Swept on epochs 1-4 of the 90M benchmark, four concurrent readers of four
+# distinct commits (the RSS-heaviest shape), 32 MiB chunk cache:
+#
+#     chunk    store    commit   mmap MB/s   peak RSS   amplification
+#     4 MiB   584 MiB    17.3s       35.66     293.6MB      47.0x
+#     2 MiB   586 MiB    16.7s       41.58     218.2MB      23.3x
+#     1 MiB   589 MiB    15.7s       63.65     173.8MB      10.7x
+#   512 KiB   594 MiB    23.0s       63.40     148.7MB       3.1x
+#
+# 1 MiB: +78% mmap throughput and -41% peak RSS against the old default, for
+# +0.9% stored bytes. The compression cost everyone expects to pay here is
+# nearly absent -- the zstd window was never the binding constraint at these
+# sizes. 512 KiB buys another 25 MB of RSS but throughput has already
+# plateaued and commits get 46% slower writing 1957 objects instead of 1233.
+#
+# Chunk boundaries are per-manifest (`row_start`/`row_end`), so changing this
+# needs no migration: existing commits stay readable and new ones simply use
+# the new size. The one commit made against a base encoded at the old size is
+# amplified, because a 1 MiB residual chunk pulls a whole 4 MiB base chunk;
+# it settles as soon as the base is re-encoded too.
+DEFAULT_CHUNK_SIZE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)

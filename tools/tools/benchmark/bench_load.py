@@ -35,8 +35,50 @@ import psutil
 import torch
 import safetensors.torch
 
+from synapsefs.codec.chunk import is_delta
 from synapsefs.fuse.daemon import find_mount_pid
+from synapsefs.graph import CommitCheckpoint
 from synapsefs.store.repo import Repo
+
+
+def minimum_object_bytes(repo: Repo, commits: "list[str]") -> float:
+    """MiB of distinct store objects needed to reconstruct `commits` once.
+
+    The denominator for every amplification figure below, derived from the
+    manifests rather than from a timed run. An earlier version of this file
+    took the baseline from a `dd` of the mount, which was wrong in a way worth
+    recording: that `dd` ran against the default chunk cache and was itself
+    re-decoding evicted chunks, so it measured 1.97x the real minimum and every
+    ratio computed from it was understated by the same factor.
+
+    The union matters. Reconstructing eight commits does not cost eight times
+    one commit -- residual chunks share delta bases, so on the 25-epoch
+    benchmark eight commits need 1550 MiB against a sum-of-parts of 1192 MiB.
+    Counting per-commit and adding would flatter the result.
+
+    Note this is *below* the file's own size (149.0 MiB of objects for a
+    176.3 MiB checkpoint): chunks are zstd-compressed, so a perfect reader
+    moves less than the bytes it serves.
+    """
+    need: set[str] = set()
+    for commit in commits:
+        ck = CommitCheckpoint(repo.store, commit)
+        need.add(ck.manifest["header_object"])
+
+        def walk(manifest_hash: str) -> None:
+            if manifest_hash in need:
+                return
+            need.add(manifest_hash)
+            manifest = ck._load(manifest_hash)
+            base = manifest.get("base_tensor_manifest")
+            for chunk in manifest["chunks"]:
+                need.add(chunk["object"])
+                if base and is_delta(chunk["encoding"]):
+                    walk(base)
+
+        for name in ck.names():
+            walk(ck._tensor_manifests[name])
+    return sum(os.path.getsize(repo.store.path_for(h)) for h in need) / (1024 * 1024)
 
 
 #: Rough working set of one reader marching through one checkpoint: the 4 MiB
@@ -45,14 +87,6 @@ from synapsefs.store.repo import Repo
 #: these; readers on different files do not, which is why the cache requirement
 #: scales with distinct files rather than with process count.
 WORKING_SET_MB_PER_DISTINCT_FILE = 64
-
-#: Daemon bytes read per byte of file served, for a cold complete read.
-#: Above 1.0 because every output byte comes from a compressed chunk plus the
-#: compressed base chunk it is a delta against. Measured on the 25-epoch 90M
-#: benchmark: 292.9 MiB of `rchar` for a 176.3 MiB file, via `dd`. Used only to
-#: judge whether a run was really cold -- never to report throughput.
-COMPLETE_READ_RATIO = 292.9 / 176.3
-
 
 def drop_linux_page_cache() -> bool:
     """Flush dirty pages and clear the Linux OS page cache via drop_caches."""
@@ -265,7 +299,7 @@ def parse_args():
     )
     parser.add_argument(
         "--commit", type=str,
-        default="7800663cd50db9f2e21ea8ee8793ac0151c149168ec978e4b62d59b493421062",
+        default="6ed842c9ae3b29982df6609237419befdfd594732034ac4816c5af81b37ec136",
         help="Commit hash or branch folder to evaluate.",
     )
     parser.add_argument(
@@ -330,6 +364,15 @@ def main():
         raise FileNotFoundError(f"Ground truth file not found: {truth_file}")
 
     repo = Repo.find(Path("."))
+
+    def commit_of(path: Path) -> str:
+        """The commit hash behind a mounted model.safetensors path."""
+        name = path.parent.name
+        if len(name) == 64 and all(c in "0123456789abcdef" for c in name):
+            return name
+        ref = repo.refs_heads_dir / name
+        return ref.read_text(encoding="utf-8").strip()
+
     fuse_pid = resolve_fuse_pid(repo, mount_dir)
     launch_spec = daemon_launch_spec(fuse_pid) if fuse_pid else None
 
@@ -362,6 +405,8 @@ def main():
     print(f"Cold Method:       {'remount + drop_caches' if args.remount and args.cold_cache else 'remount' if args.remount else 'drop_caches only' if args.cold_cache else 'NONE (warm)'}")
     print(f"File Size:         {mount_size} bytes ({size_mb:.2f} MB)")
     print(f"Cold Cache Mode:   {args.cold_cache}")
+    minimum_one = minimum_object_bytes(repo, [commit_of(mount_file)])
+    print(f"Minimum Object Bytes:  {minimum_one:.1f} MiB to reconstruct this commit once")
     print("=" * 60)
 
     assert mount_size == truth_size, f"Size mismatch: {mount_size} != {truth_size}"
@@ -382,16 +427,13 @@ def main():
         # the decode path. Say so on the row itself -- the throughput column
         # alone reads as a real result and is off by two orders of magnitude.
         #
-        # The bar is COMPLETE_READ_RATIO x the file size, not a fraction of it:
-        # the daemon reads compressed chunks *and* the delta bases behind them,
-        # so a genuinely cold complete read costs more input than the file's
-        # output size, not less. Measured at 292.9 MiB for a 176.3 MiB file.
+        # Judged against the analytic minimum, not against the file size.
         if not fuse_pid or not label.startswith("cold"):
             note = ""            # a warm row *should* read nothing; that is the point of it
-        elif served < size_mb * COMPLETE_READ_RATIO * 0.6:
+        elif served < minimum_one * 0.6:
             note = "  <- not actually cold, page cache served it"
-        elif served > size_mb * COMPLETE_READ_RATIO * 1.5:
-            note = f"  <- {served / (size_mb * COMPLETE_READ_RATIO):.1f}x a sequential read"
+        elif served > minimum_one * 1.5:
+            note = f"  <- {served / minimum_one:.1f}x the minimum"
         else:
             note = ""
         print(f"  {label:<12} {dur:9.3f} {size_mb / dur:9.1f} {served:10.1f} MiB {rss:9.1f} MB{note}")
@@ -447,6 +489,7 @@ def main():
     served = (get_process_rchar_mb(fuse_pid) - rchar_before) if fuse_pid else 0.0
     total_mb = size_mb * len(results)
     n_distinct = len(set(targets))
+    target_commits = [commit_of(t) for t in targets]
     incomplete = [r for r in results if not r["complete"]]
     slowest = max(r["duration"] for r in results)
 
@@ -461,19 +504,17 @@ def main():
     print(f"Aggregate Throughput:  {total_mb / wall_time:.2f} MB/s")
     print(f"Slowest Worker:        {slowest:.3f} s")
     if fuse_pid:
-        # Scale by DISTINCT files, not by worker count. Workers on the same
-        # file want the same chunks at the same time, so the decode path is
-        # walked once no matter how many of them there are -- billing the
-        # baseline per worker inflates it 8x and hides real amplification as
-        # "comfortably under budget".
-        expected = size_mb * n_distinct * COMPLETE_READ_RATIO
-        print(f"Distinct Files Read:   {n_distinct} (a cold pass over them costs ~{expected:.0f} MiB)")
+        # Scale by the DISTINCT files actually read, as a union: workers on
+        # the same file share a working set, and different commits share delta
+        # bases, so neither "per worker" nor "sum of per-commit" is right.
+        expected = minimum_object_bytes(repo, sorted(set(target_commits)))
+        print(f"Distinct Files Read:   {n_distinct} (reconstructing them needs {expected:.0f} MiB of objects)")
         print(f"Daemon Bytes Served:   {served:.1f} MiB")
         if served < expected * 0.6:
-            print("  ^ well under a cold pass: the kernel page cache served part of this.")
+            print("  ^ well under the minimum: the kernel page cache served part of this.")
             print("    Use --remount to measure the decode path.")
         elif served > expected * 1.5:
-            print(f"  ^ {served / expected:.1f}x a cold pass -- chunks are being decoded, evicted,")
+            print(f"  ^ {served / expected:.1f}x the minimum -- chunks are being decoded, evicted,")
             print("    and decoded again. The chunk cache has to hold the working set of every")
             print(f"    DISTINCT file being read at once (~64 MiB each, so ~{64 * n_distinct} MiB here).")
             print(f"    Raise --cache-size on the mount, or read fewer distinct commits at once.")

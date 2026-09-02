@@ -154,7 +154,7 @@ def parse_args():
     parser.add_argument(
         "--commit",
         type=str,
-        default="7800663cd50db9f2e21ea8ee8793ac0151c149168ec978e4b62d59b493421062",
+        default="6ed842c9ae3b29982df6609237419befdfd594732034ac4816c5af81b37ec136",
         help="Commit hash or branch folder to evaluate.",
     )
     parser.add_argument(
@@ -231,21 +231,16 @@ def main():
 
     assert mount_size == truth_size, f"Size mismatch: {mount_size} != {truth_size}"
 
-    # Phase 1: High-level verification
-    full_tensor_sanity_check(mount_file, truth_file)
-
-    # If running in cold-cache mode, clear page cache again between Phase 1 and Phase 2
-    # so the concurrent read throughput starts strictly cold
-    if args.cold_cache:
-        drop_linux_page_cache()
-
-    # Phase 2: Concurrent Benchmark & RSS sampling
-    initial_rss = get_process_rss_mb(fuse_pid) if fuse_pid else 0.0
-    print("\n[Phase 2] Starting Concurrency, RSS, and Throughput Evaluation")
-    if fuse_pid:
-        print(f"Tracking FUSE Daemon (PID: {fuse_pid}) | Baseline RSS: {initial_rss:.2f} MB")
-
-    peak_rss = [initial_rss]
+    # Sample RSS across the WHOLE run, not just phase 2.
+    #
+    # This used to start after phase 1, and phase 1 is where the peak actually
+    # is: it loads both state dicts, so the daemon decodes the entire
+    # checkpoint there. Measured on the 92M benchmark, 8 workers -- this
+    # reported "210.32 MB (Delta: +0.00 MB)" against a true peak of 266.5 MB
+    # sampled externally. A +0.00 delta reads as "this workload costs nothing",
+    # which is exactly backwards.
+    idle_rss = get_process_rss_mb(fuse_pid) if fuse_pid else 0.0
+    peak_rss = [idle_rss]
     stop_sampler = False
 
     def sample_rss():
@@ -255,9 +250,23 @@ def main():
                 peak_rss[0] = rss
             time.sleep(0.01)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as sampler_pool:
+    sampler_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    if fuse_pid:
+        sampler_pool.submit(sample_rss)
+
+    try:
+        # Phase 1: High-level verification
+        full_tensor_sanity_check(mount_file, truth_file)
+
+        # If running in cold-cache mode, clear page cache again between Phase 1
+        # and Phase 2 so the concurrent read throughput starts strictly cold
+        if args.cold_cache:
+            drop_linux_page_cache()
+
+        # Phase 2: Concurrent Benchmark
+        print("\n[Phase 2] Starting Concurrency, RSS, and Throughput Evaluation")
         if fuse_pid:
-            sampler_pool.submit(sample_rss)
+            print(f"Tracking FUSE Daemon (PID: {fuse_pid}) | Idle RSS: {idle_rss:.2f} MB")
 
         t0 = time.perf_counter()
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -276,7 +285,9 @@ def main():
             results = [f.result() for f in futures]
 
         wall_time = time.perf_counter() - t0
+    finally:
         stop_sampler = True
+        sampler_pool.shutdown(wait=True)
 
     total_bytes = sum(r["bytes_read"] for r in results)
     total_mismatches = sum(r["mismatches"] for r in results)
@@ -292,8 +303,9 @@ def main():
     print(f"Wall Clock Time:       {wall_time:.3f} s")
     print(f"Read Throughput:       {throughput:.2f} MB/s")
     if fuse_pid:
-        print(f"Initial Daemon RSS:    {initial_rss:.2f} MB")
-        print(f"Peak Daemon RSS:       {peak_rss[0]:.2f} MB (Delta: +{peak_rss[0] - initial_rss:.2f} MB)")
+        print(f"Idle Daemon RSS:       {idle_rss:.2f} MB")
+        print(f"Peak Daemon RSS:       {peak_rss[0]:.2f} MB "
+              f"(Delta: +{peak_rss[0] - idle_rss:.2f} MB, whole run incl. phase 1)")
     print("=" * 50)
 
 
