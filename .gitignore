@@ -53,7 +53,9 @@ tools/benchmark/
 tools/data
 chunk_export
 tools/tools/benchmark-mlp
-tools/tools/benchmark
+tools/tools/benchmark/*
+!tools/tools/benchmark/bench_fuse.py
+!tools/tools/benchmark/bench_load.py
 tools/tools/benchmark-bf16
 tools/tools/benchmark-mlp-seed1synapsefs/networking/spp
 .nvim/

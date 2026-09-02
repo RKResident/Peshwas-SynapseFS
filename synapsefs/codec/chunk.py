@@ -653,7 +653,20 @@ def decode_chunk(
     # reinterprets the bytes anyway, so materialising them is pure waste.
 
     if HAS_FAST_CHUNK and width == 2 and encoding == DELTA_SHUFFLE and base is not None:
-        return fast_decode_delta_shuffle_w2(stream, base)
+        # The Cython kernel adds `len(stream) // 2` elements of `base` with the
+        # GIL dropped and no bounds checking, so a base shorter than the
+        # residual is an out-of-bounds heap read rather than an exception --
+        # it decodes without complaint and serves whatever memory follows the
+        # base buffer. The pure-Python path below raises on the same mismatch;
+        # this keeps the two paths agreeing on it before the pointers are taken.
+        b_bits = _as_bits(base, width, "base")
+        residual_size = len(stream) // 2
+        if residual_size != b_bits.size:
+            raise ValueError(
+                f"residual has {residual_size} elements but base chunk has "
+                f"{b_bits.size}"
+            )
+        return fast_decode_delta_shuffle_w2(stream, b_bits)
 
     values = unshuffle_to_array(stream, width) if encoding in _SHUFFLED else None
 

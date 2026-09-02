@@ -102,7 +102,7 @@ def put_json(store: ObjectStore, obj: Any) -> str:
 
 
 def get_json(store: ObjectStore, object_hash: str) -> Any:
-    return json.loads(store.get(object_hash).decode("utf-8"))
+    return json.loads(store.get_bytes(object_hash).decode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -608,7 +608,7 @@ class CommitCheckpoint:
     @property
     def header_bytes(self) -> bytes:
         """The verbatim source header, for byte-exact reconstruction."""
-        return self.store.get(self.manifest["header_object"])
+        return self.store.get_bytes(self.manifest["header_object"])
 
     # -- reconstruction ----------------------------------------------------
 
