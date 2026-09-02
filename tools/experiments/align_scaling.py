@@ -2,7 +2,7 @@
 
 Reproduces ARCHITECTURE.md 4.6.3.
 
-Every other alignment number in the docs comes from one model: the 92M CNN
+Every other alignment number in the old_docs comes from one model: the 92M CNN
 benchmark, whose widest permutation group is 1792 units. The PS evaluates up to
 roughly 7B parameters, and the quantities that matter here grow with the *width*
 of a layer, not with the parameter count -- the cost matrix is [n, n] and the

@@ -84,7 +84,7 @@ __all__ = [
 
 PathLike = Union[str, "os.PathLike[str]"]
 
-# OPEN QUESTION 1.2 (docs/OPEN_QUESTIONS.md) -- CLOSED, measured.
+# OPEN QUESTION 1.2 (old_docs/OPEN_QUESTIONS.md) -- CLOSED, measured.
 #
 # The chunk is the unit of decoding, so its size is not a storage parameter,
 # it is the READ path's granularity: a 4 KiB page fault from a memory-mapped

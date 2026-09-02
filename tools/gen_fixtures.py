@@ -88,7 +88,7 @@ Tensors = dict[str, np.ndarray]
 # A permutation group maps a group id (e.g. "g_hidden_0") to an int32 array `p`
 # where `p[i]` is the index in the *source* model that lands at position `i` in
 # the *permuted* model. This matches the `base_row_permutation` convention in
-# docs/FileFormat.md section 4.2, deliberately: fixtures and production speak the
+# old_docs/FileFormat.md section 4.2, deliberately: fixtures and production speak the
 # same dialect.
 PermGroups = dict[str, np.ndarray]
 
@@ -112,7 +112,7 @@ ALL_VARIANTS = (
 #      says checkpoints are evaluated in fp16/bf16. Writing the container
 #      ourselves gets bf16 for free -- the payload is just uint16 bytes.
 #   2. It forces us to encode the three conventions that silently break
-#      byte-exactness downstream (see docs/FileFormat.md section 1.2), so they
+#      byte-exactness downstream (see old_docs/FileFormat.md section 1.2), so they
 #      are exercised from day one rather than discovered during integration.
 #
 # tests/test_fixtures.py asserts this writer round-trips through the real
@@ -510,7 +510,7 @@ def finetune(t: Tensors, rng: np.random.Generator, rel_scale: float = 1e-3) -> T
 
     The perturbation is dense -- every element moves. That is the realistic
     fine-tuning case and it is why chunk-level deduplication buys little on the
-    residual itself (see docs/FORMAT.md section 1.3).
+    residual itself (see old_docs/FORMAT.md section 1.3).
 
     Args:
         rel_scale: Noise standard deviation as a fraction of each tensor's own.
@@ -884,7 +884,7 @@ def _human(n: int) -> str:
 def _check_disk(out: Path, spec: MLPSpec | CNNSpec, n_variants: int, dtype: str) -> None:
     """Warn before filling a nearly-full disk.
 
-    The development machine has ~24 GB free on a 93%-full drive (docs/PLAN.md
+    The development machine has ~24 GB free on a 93%-full drive (old_docs/PLAN.md
     section 0), so a careless ``--size large --all`` is a real hazard.
     """
     per_elem = 4 if dtype == "fp32" else 2

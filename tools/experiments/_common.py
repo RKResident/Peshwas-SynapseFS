@@ -1,6 +1,6 @@
 """Shared loading for the measurement scripts.
 
-Every script here reproduces a number that appears in `docs/ARCHITECTURE.md`.
+Every script here reproduces a number that appears in `old_docs/ARCHITECTURE.md`.
 They read real checkpoint pairs rather than synthetic data, because the whole
 point of the measurements is that the answers depend on the actual weight
 distribution -- several conclusions flipped when tested on a different epoch
