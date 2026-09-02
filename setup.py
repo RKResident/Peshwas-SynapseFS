@@ -7,7 +7,7 @@ extensions = [
         "synapsefs.codec.fast_chunk",
         sources=["synapsefs/codec/fast_chunk.pyx"],
         include_dirs=[np.get_include()],
-        extra_compile_args=["-O3", "-march=native"],
+        extra_compile_args=["-O3", "-march=x86-64-v3"],
     )
 ]
 

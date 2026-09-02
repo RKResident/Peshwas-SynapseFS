@@ -12,6 +12,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
+from synapsefs.fuse.cache import DEFAULT_CACHE_SIZE_BYTES
 from synapsefs.fuse.daemon import mount_fuse
 from synapsefs.store.repo import Repo
 
@@ -45,8 +46,13 @@ def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
         help="Run in the foreground rather than daemonizing",
     )
     parser.add_argument(
-        "--cache-size", default=0, type=int,
-        help="Hard cap on decoded-chunk cache in bytes (default: 0 MiB). Only enable if you know what you're doing",
+        "--cache-size", default=DEFAULT_CACHE_SIZE_BYTES, type=int,
+        help=(
+            "Hard cap on decoded-chunk cache in bytes "
+            f"(default: {DEFAULT_CACHE_SIZE_BYTES // (1024 * 1024)} MiB). Raise it only "
+            "for workloads that re-read the same chunks; a larger cache costs RSS "
+            "roughly one-for-one and buys no throughput past the in-flight set."
+        ),
     )
     parser.add_argument(
         "--allow-other", action="store_true",

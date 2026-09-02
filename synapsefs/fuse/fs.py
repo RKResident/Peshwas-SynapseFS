@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import pyfuse3
 import trio
 
-from synapsefs.fuse.cache import ChunkCache
+from synapsefs.fuse.cache import ChunkCache, DEFAULT_CACHE_SIZE_BYTES
 from synapsefs.fuse.reconstruct import VirtualSafetensorsFile
 from synapsefs.graph import CommitCheckpoint, ancestors
 from synapsefs.store.repo import Repo
@@ -52,7 +52,7 @@ class SynapseFSOperations(pyfuse3.Operations):
         self,
         repo: Repo,
         ref_filter: Optional[str] = None,
-        cache_size_bytes: int = 512 * 1024 * 1024,
+        cache_size_bytes: int = DEFAULT_CACHE_SIZE_BYTES,
     ) -> None:
         super().__init__()
         self.repo = repo
