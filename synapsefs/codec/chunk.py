@@ -31,6 +31,12 @@ import struct
 import numpy as np
 import zstandard as zstd
 
+try:
+    from synapsefs.codec.fast_chunk import fast_unshuffle_w2, fast_decode_delta_shuffle_w2
+    HAS_FAST_CHUNK = True
+except ImportError:
+    HAS_FAST_CHUNK = False
+
 __all__ = [
     "EncodedChunk",
     "encode_chunk",
@@ -353,6 +359,10 @@ def unshuffle_to_array(stream: bytes, width: int) -> np.ndarray:
     Returning an array rather than `bytes` removes a second full copy: the
     decoder's next act was `np.frombuffer` over the bytes this used to build.
     """
+    if HAS_FAST_CHUNK and width == 2:
+        return fast_unshuffle_w2(stream)
+    # Cython option
+
     a = np.frombuffer(stream, dtype=np.uint8).reshape(width, -1)
     out = np.empty(a.shape[1], dtype=_UINT_OF[width])
     view = out.view(np.uint8).reshape(-1, width)
@@ -641,6 +651,23 @@ def decode_chunk(
     stream = plain_stream(encoding, payload, decompressor=decompressor)
     # The shuffled encodings go straight to an array; everything downstream
     # reinterprets the bytes anyway, so materialising them is pure waste.
+
+    if HAS_FAST_CHUNK and width == 2 and encoding == DELTA_SHUFFLE and base is not None:
+        # The Cython kernel adds `len(stream) // 2` elements of `base` with the
+        # GIL dropped and no bounds checking, so a base shorter than the
+        # residual is an out-of-bounds heap read rather than an exception --
+        # it decodes without complaint and serves whatever memory follows the
+        # base buffer. The pure-Python path below raises on the same mismatch;
+        # this keeps the two paths agreeing on it before the pointers are taken.
+        b_bits = _as_bits(base, width, "base")
+        residual_size = len(stream) // 2
+        if residual_size != b_bits.size:
+            raise ValueError(
+                f"residual has {residual_size} elements but base chunk has "
+                f"{b_bits.size}"
+            )
+        return fast_decode_delta_shuffle_w2(stream, b_bits)
+
     values = unshuffle_to_array(stream, width) if encoding in _SHUFFLED else None
 
     if encoding in (RAW, RAW_ZSTD, RAW_SHUFFLE_ZSTD):

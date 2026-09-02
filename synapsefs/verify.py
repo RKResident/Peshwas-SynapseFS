@@ -245,7 +245,9 @@ class _Walker:
         if data is None:
             return None
         try:
-            return json.loads(data.decode("utf-8"))
+            # `load_object` hands back the store's memoryview so the hash
+            # check upstream stays zero-copy; only the parse needs real bytes.
+            return json.loads(bytes(data).decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             self.fail(Failure(
                 kind="malformed-object",

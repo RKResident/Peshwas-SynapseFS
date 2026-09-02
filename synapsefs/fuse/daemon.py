@@ -20,6 +20,7 @@ import pyfuse3
 import trio
 
 from synapsefs.errors import MountError, UsageError
+from synapsefs.fuse.cache import DEFAULT_CACHE_SIZE_BYTES
 from synapsefs.fuse.fs import SynapseFSOperations
 from synapsefs.store.repo import Repo
 
@@ -83,17 +84,42 @@ def run_fuse_loop(
         ops.close()
 
 
+def _limit_malloc_arenas(max_arenas: int = 2) -> bool:
+    """Cap glibc's per-thread malloc arenas. Best-effort; returns success.
+
+    Decoded chunks are ~4 MiB allocations, right at glibc's adaptive
+    `M_MMAP_THRESHOLD`. Once the threshold ratchets past them they stop coming
+    from `mmap` (returned to the OS on free) and start coming from per-thread
+    arena heaps, of which glibc will create up to `8 * ncores` and never give
+    any back. On the 25-epoch benchmark that inflated peak daemon RSS by
+    ~150 MiB at a 512 MiB cache and ~33 MiB at 32 MiB.
+
+    Must run before the worker threads exist, since arenas are created lazily
+    on first allocation from a new thread -- hence the call at the top of
+    `mount_fuse` rather than anywhere nearer the read path.
+    """
+    try:
+        import ctypes
+        M_ARENA_MAX = -8
+        return ctypes.CDLL("libc.so.6").mallopt(M_ARENA_MAX, max_arenas) == 1
+    except Exception:
+        # Not glibc, or no ctypes. The daemon runs fine either way.
+        return False
+
+
 def mount_fuse(
     repo: Repo,
     mountpoint: Union[str, Path],
     *,
     ref: Optional[str] = None,
     foreground: bool = False,
-    cache_size: int = 512 * 1024 * 1024,
+    cache_size: int = DEFAULT_CACHE_SIZE_BYTES,
     allow_other: bool = False,
     debug_fuse: bool = False,
 ) -> dict:
     """Mount a SynapseFS repository at `mountpoint`."""
+    _limit_malloc_arenas()
+
     mount_path = Path(mountpoint).resolve()
     if not mount_path.exists():
         raise UsageError(f"mountpoint does not exist: {mount_path}")
