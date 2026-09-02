@@ -19,6 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import blake3
+import os
 
 from synapsefs.errors import ObjectNotFoundError
 from synapsefs.store.atomic import atomic_write, gc_tmp_dir
@@ -109,6 +110,21 @@ class ObjectStore:
     def get(self, object_hash: str) -> bytes:
         """Read back the bytes stored under `object_hash`.
 
+        Returns `bytes`, not a view over a mapping. Serving these from `mmap`
+        was measured on the 25-epoch 90M benchmark and is a net loss: it wins
+        1.14x in-process when the *same* object is re-read, but a FUSE daemon
+        rarely gets that -- `keep_cache=True` means the kernel page cache
+        absorbs repeat reads of a file before they reach this layer -- and
+        end-to-end it was inside the noise on throughput (189-222 MB/s either
+        way) while taking peak daemon RSS from ~215 MiB to 1.9 GiB. Mapped
+        pages are charged to the process; the identical pages behind `read()`
+        stay in the page cache, unattributed and freely reclaimable.
+
+        Nor is there a copy here worth removing: `np.frombuffer` over a
+        `bytes` is already zero-copy (its `.base` *is* the bytes object), and
+        zstd decompresses from either. The remaining cost at this layer is
+        cold disk I/O, which a different return type cannot help.
+
         Raises ObjectNotFoundError (not a bare FileNotFoundError) so
         callers up the stack can catch one exception type regardless of
         whether the miss came from this store, a pack index, or anywhere
@@ -120,3 +136,15 @@ class ObjectStore:
         except FileNotFoundError as exc:
             raise ObjectNotFoundError(object_hash) from exc
 
+    def get_bytes(self, object_hash: str) -> bytes:
+        """The object as `bytes`, for consumers that *parse* rather than stream.
+
+        Today `get` already returns `bytes`, so this is a passthrough. It earns
+        its place as a marked boundary: `json.loads` cannot accept a memoryview
+        at all and the safetensors header is `.decode`d, so if `get` is ever
+        moved back to a buffer type these are exactly the call sites that break
+        -- and they broke, silently and totally, the last time it moved.
+        Streaming consumers (chunk payloads into zstd, `verify`'s blake3 check)
+        deliberately do not come through here.
+        """
+        return self.get(object_hash)

@@ -128,14 +128,7 @@ class CheckpointResult:
 
     stored_bytes: int
     """Bytes this commit actually adds to the repository: the sum of
-    `stored_len` over the chunks passed to `emit`, and *only* those.
-
-    Deduped chunks are deliberately excluded. Counting them would make the
-    numerator blind to the one thing dedup is for -- on a checkpoint with
-    four byte-identical tensors it overstates the real cost fourfold, so a
-    `residual_ratio` computed from it reads 92% where the true figure is
-    23%. Whatever else that number is, it is not a measure of what the
-    commit cost."""
+    `stored_len` over the chunks passed to `emit`, and *only* those."""
 
     deduped_bytes: int
     """What dedup saved: the summed `stored_len` of chunks that were *not*

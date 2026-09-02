@@ -32,12 +32,19 @@ def run(args: argparse.Namespace) -> dict:
     current_dir = Path(__file__).resolve().parent
     spp_path = current_dir.parent.parent / "networking/spp"
 
-    result = subprocess.run(
+    result = subprocess.Popen(
         [str(spp_path), "pull", args.ip, args.port, args.branch],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=True,
+        bufsize=1
     )
+
+    for line in result.stdout:
+        print(line, end="")
+
+    for line in result.stderr:
+        print(line, end="")
 
     return {
         "port": args.port,
