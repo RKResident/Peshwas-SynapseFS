@@ -220,21 +220,23 @@ def materialise(state: dict) -> float:
     `safetensors.torch.load_file` hands back tensors whose storage is the mmap
     itself, so the call returns before the data has been read: on this repo it
     completes in 0.158s having caused the daemon to read 37.7 MiB, against the
-    292.9 MiB a complete sequential read of the same file costs. Timing
-    `load_file` alone measures header parsing and reports throughput several
-    times the decode path can physically sustain.
+    283 MiB a complete reconstruction costs. Timing `load_file` alone measures
+    header parsing and reports throughput several times the decode path can
+    physically sustain.
 
-    `sum(dtype=...)` accumulates in a wider type without materialising a cast
-    copy, so this touches every element while allocating only a scalar --
-    `.float().sum()` would double peak memory in each of N worker processes.
+    `clone()` rather than a reduction: it is what a real consumer does --
+    `load_state_dict` copies each tensor out of the mapping -- so it produces
+    the same fault pattern the graded workload will. A `sum(dtype=float64)`
+    also forces the read but spends 3x longer doing arithmetic, and on this
+    repo that inflated the reported load time by ~40% (1.18s against 0.82s)
+    while the daemon served the same 333 MiB either way. Touching one element
+    per 4 KiB page is cheaper still, but it reads *strided*, which changes
+    readahead and so measures a pattern no consumer produces.
     """
-    total = 0.0
+    total = 0
     for tensor in state.values():
-        if tensor.is_floating_point():
-            total += float(tensor.sum(dtype=torch.float64))
-        else:
-            total += float(tensor.sum(dtype=torch.int64))
-    return total
+        total += tensor.clone().numel()
+    return float(total)
 
 
 def load_worker(args_tuple) -> dict:

@@ -27,7 +27,7 @@ import json
 
 from synapsefs import anchor as anchor_policy
 from synapsefs import graph
-from synapsefs.align import config_parser, lap, report as align_report, solver
+from synapsefs.align import config_parser, solver, lap
 from synapsefs.align.Error import AlignError
 from synapsefs.align.IR import TensorRef
 from synapsefs.cli import output

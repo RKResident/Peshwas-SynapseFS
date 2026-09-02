@@ -39,8 +39,6 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
-
 from synapsefs.align import config_parser, solver
 from synapsefs.align.IR import TensorRef
 from synapsefs.align.reader import SafetensorsReader

@@ -67,6 +67,7 @@ class SynapseFSOperations(pyfuse3.Operations):
         # decode holds the GIL anyway, so extra threads buy no parallelism.
         self.read_threads = int(os.environ.get("SYNAPSEFS_READ_THREADS", "8"))
         self._read_limiter = trio.CapacityLimiter(self.read_threads)
+        self._inline_hits = os.environ.get("SYNAPSEFS_INLINE_HITS", "1") != "0"
         # Chunks are loose, content-addressed objects (ARCHITECTURE.md 3.3),
         # so there is no pack set to open, hold open, or close -- the object
         # store is reached through `repo.store` directly.
@@ -502,6 +503,15 @@ class SynapseFSOperations(pyfuse3.Operations):
         vfile = self._fh_to_vfile.get(fh)
         if vfile is None:
             raise pyfuse3.FUSEError(errno.EBADF)
+
+        # A cache hit is a memoryview slice: serve it on the event loop rather
+        # than paying a thread round-trip that costs more than the work.
+        # A miss decodes, which would stall every other request if run here, so
+        # it still goes to the pool. Set SYNAPSEFS_INLINE_HITS=0 to disable.
+        if self._inline_hits:
+            hit = vfile.try_read_cached(off, size)
+            if hit is not None:
+                return hit
 
         # Offload decompression and row gather to thread pool
         return await trio.to_thread.run_sync(

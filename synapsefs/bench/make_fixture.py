@@ -29,9 +29,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from align.config_parser import parse
-from align.IR import TensorRef
-from align.reader import SafetensorsReader
+from synapsefs.align.config_parser import parse
+from synapsefs.align.IR import TensorRef
+from synapsefs.align.reader import SafetensorsReader
 
 VARIANTS = ("permuted", "noisy", "finetune", "unrelated")
 

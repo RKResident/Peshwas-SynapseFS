@@ -34,11 +34,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from align.config_parser import from_checkpoint
-from align.lap import agreement
-from align.reader import SafetensorsReader
-from align.residual import NOT_ALIGNABLE_THRESHOLD
-from align.solver import align_checkpoints
+from synapsefs.align.config_parser import from_checkpoint
+from synapsefs.align.lap import agreement
+from synapsefs.align.reader import SafetensorsReader
+from synapsefs.align.residual import NOT_ALIGNABLE_THRESHOLD
+from synapsefs.align.solver import align_checkpoints
 
 
 def peak_rss_mib() -> float:

@@ -13,13 +13,11 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from synapsefs import graph, merge as merge_engine
-from synapsefs.align import config_parser, lap, solver
+from synapsefs.align import config_parser, solver
 from synapsefs.align.Error import AlignError
 from synapsefs.align.IR import TensorRef
-from synapsefs.cli import output
 from synapsefs.codec.checkpoint import TensorPermutation, encode_checkpoint
 from synapsefs.errors import ConflictError, UsageError
 from synapsefs.materialize import materialize

@@ -22,6 +22,11 @@ SynapseFS is a purpose-built version control system and virtual file system desi
   - [Commands](#commands)
 - [Design Decisions & Benchmark Trade-offs](#design-decisions--benchmark-trade-offs)
 - [Installation & Quick Start](#installation--quick-start)
+  - [Prerequisites](#prerequisites)
+  - [1. Installation](#1-installation)
+  - [1a. Verifying the install](#1a-verifying-the-install)
+  - [1b. The C++ transfer tool](#1b-the-c-transfer-tool)
+  - [2. Workflow Walkthrough](#2-workflow-walkthrough)
 - [Examples & Interactive Tutorials](#examples--interactive-tutorials)
 - [Development & Testing](#development--testing)
 
@@ -248,22 +253,100 @@ synapsefs restore <ref> --out <dest.safetensors> [--reference <ref.safetensors>]
 
 ## Installation & Quick Start
 
+Every step below was verified from an empty virtualenv on a clean interpreter.
+
 ### Prerequisites
-- Linux OS (Fedora, Ubuntu, Debian, Arch)
-- Python $\ge 3.11$
-- `libfuse3` and `fusermount3`
+
+**Python 3.11 or newer.** Ubuntu 22.04 ships 3.10 as `python3`, which `pip`
+rejects outright (`Package 'synapsefs' requires a different Python`). Check with
+`python3 -V` and use `python3.12`/`python3.13`/`python3.14` explicitly if the
+default is older.
+
+**System packages.** Two extension modules are compiled during install --
+`pyfuse3` and this project's own Cython codec kernel -- so a compiler and
+headers are required, not just a Python environment:
+
+```bash
+# Debian / Ubuntu
+sudo apt install build-essential pkg-config libfuse3-dev fuse3 \
+                 python3-dev            # must match your interpreter,
+                                        # e.g. python3.12-dev for python3.12
+
+# Fedora
+sudo dnf install gcc gcc-c++ pkgconf-pkg-config fuse3-devel fuse3 python3-devel
+
+# Arch
+sudo pacman -S base-devel pkgconf fuse3 python
+```
+
+Omitting `python3-dev` is the most common failure: the build gets as far as the
+compiler and stops at `fatal error: Python.h: No such file or directory`, for
+both `pyfuse3` and the codec kernel. `libfuse3-dev` and `pkg-config` are needed
+by `pyfuse3`'s build, and `fuse3` provides the `fusermount3` binary that
+`mount`/`unmount` shell out to.
+
+**CPU.** The codec kernel is compiled with `-march=x86-64-v3` (see `setup.py`),
+which requires AVX2 -- Intel Haswell / AMD Excavator, 2013 or later. On an older
+CPU or a non-x86 machine, drop that flag from `setup.py`; the build then falls
+back to portable C and everything still works, just slower on the unshuffle.
 
 ### 1. Installation
-Clone the repository and install with development dependencies:
 
 ```bash
 git clone https://github.com/Peshwas-SynapseFS/Peshwas-SynapseFS.git
 cd Peshwas-SynapseFS
 
-python3 -m venv .venv
+python3.12 -m venv .venv          # or any interpreter >= 3.11
 source .venv/bin/activate
-pip install --no-build-isolation -e ".[dev]"
+
+pip install -e .
 ```
+
+**Do not pass `--no-build-isolation`.** `setup.py` imports `Cython` and `numpy`
+at build time; with isolation, pip provides them from `[build-system] requires`,
+and without it they have to be in the venv already -- which on a fresh venv they
+are not, so the install dies with `ModuleNotFoundError: No module named
+'Cython'` before it reads a single dependency.
+
+For the test suite and the torch-based examples:
+
+```bash
+pip install -e ".[dev]"           # adds pytest, torch and matplotlib
+make fixtures                     # generate the tiny fixtures the tests need
+make test
+```
+
+### 1a. Verifying the install
+
+```bash
+synapsefs --help                                        # CLI imports cleanly
+python -c "from synapsefs.codec.chunk import HAS_FAST_CHUNK; print(HAS_FAST_CHUNK)"
+```
+
+`HAS_FAST_CHUNK` printing `True` means the Cython kernel compiled and is in use.
+`False` is not fatal -- `chunk.py` falls back to a pure-numpy path -- but the
+unshuffle is roughly 6x slower, so it is worth fixing rather than ignoring. The
+compiled artifact is `synapsefs/codec/fast_chunk*.so`; it is gitignored and
+rebuilt per machine.
+
+### 1b. The C++ transfer tool
+
+Push/pull between peers is a standalone C++ binary, deliberately not part of the
+Python package, so a machine can host a repository without a Python environment:
+
+```bash
+make network                      # builds synapsefs/networking/spp
+```
+
+A prebuilt `spp` is committed to the repository as an **x86-64 ELF binary**.
+Rebuild it on any new machine rather than trusting the checked-in one -- it will
+not run on a different architecture, and it is not guaranteed to match the
+current `spp.cpp`. It is not installed onto `PATH`; invoke it by path, and
+**run it from inside `.synapse/`** -- every path it uses is relative to the
+repository's internal directory, so from the repo root it silently finds
+nothing. See `synapsefs/networking/README.md` for the protocol and its
+deliberate omissions (it does not verify what it receives -- run
+`synapsefs verify` after a pull).
 
 ### 2. Workflow Walkthrough
 
