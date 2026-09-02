@@ -74,7 +74,7 @@ def test_writer_matches_reference_implementation(tmp_path: Path):
 
 
 def test_writer_layout_conventions(tmp_path: Path):
-    """The three conventions from docs/FileFormat.md section 1.2, asserted directly."""
+    """The three conventions from old_docs/FileFormat.md section 1.2, asserted directly."""
     p = tmp_path / "m.safetensors"
     save_safetensors(
         p,

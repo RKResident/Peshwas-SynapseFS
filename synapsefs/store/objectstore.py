@@ -56,7 +56,7 @@ class ObjectStore:
         ambiguity at every call site.
 
         The filename is the hash **minus** the shard prefix, matching the
-        loose-object convention in `docs/kris_docs.md`. The single source of
+        loose-object convention in `old_docs/kris_docs.md`. The single source of
         truth for the layout -- `put`, `get` and `has` all route through here.
         """
         return self.objects_dir / object_hash[:2] / object_hash[2:4] / object_hash[4:]

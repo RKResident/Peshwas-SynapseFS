@@ -1,7 +1,7 @@
 """FUSE read-only virtual filesystem implementation using pyfuse3 and trio.
 
 Maps commits and branches to virtual .safetensors files that decode tensor rows
-on demand without disk pre-materialization (docs/CLI.md ~11, docs/TeamInstructions.md ~B).
+on demand without disk pre-materialization (old_docs/CLI.md ~11, old_docs/TeamInstructions.md ~B).
 """
 
 from __future__ import annotations

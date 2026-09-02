@@ -1,4 +1,4 @@
-"""mmap-backed `.safetensors` reader (docs/FileFormat.md section 1).
+"""mmap-backed `.safetensors` reader (old_docs/FileFormat.md section 1).
 
 This module exists because `safetensors.safe_open(..., framework="numpy")` is
 dead for two reasons, both verified empirically against safetensors 0.8.0:

@@ -1,6 +1,6 @@
 """Per-layer delta statistics across every consecutive epoch pair.
 
-Reproduces the layer-wise table in `docs/ARCHITECTURE.md` §4.1.
+Reproduces the layer-wise table in `old_docs/ARCHITECTURE.md` §4.1.
 
 The codec compresses a *residual*, so the only thing that decides how well a
 checkpoint packs is how far each tensor moved since the base. That is not a

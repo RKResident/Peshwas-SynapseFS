@@ -1,6 +1,6 @@
 """How much lossless headroom is actually left, and where.
 
-Reproduces the headroom decomposition in `docs/ARCHITECTURE.md` §4.1.3.
+Reproduces the headroom decomposition in `old_docs/ARCHITECTURE.md` §4.1.3.
 
 The byte shuffle splits the residual into two planes of exactly equal size, and
 they could not be more different: the high plane (sign + exponent + top

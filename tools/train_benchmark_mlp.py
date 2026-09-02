@@ -1,7 +1,7 @@
 """Train a ~40M-parameter fully-connected net on CIFAR-100, saving every epoch.
 
 The second storage benchmark. Every compression conclusion in
-`docs/ARCHITECTURE.md` §4.1 was measured on `train_benchmark.py`'s 92M CNN, and
+`old_docs/ARCHITECTURE.md` §4.1 was measured on `train_benchmark.py`'s 92M CNN, and
 a conclusion drawn from one architecture is a conclusion about that
 architecture until it is checked on another. This model exists to check them.
 

@@ -214,7 +214,7 @@ def gc_tmp_dir(tmp_dir: Path, *, min_age_seconds: float = TMP_MIN_AGE_SECONDS) -
     what the tests for "abandoned debris is collected" use so they do not
     have to fake mtimes.
 
-    docs/OPEN_QUESTIONS.md 2.3 tracks the cleaner fix: move this to an
+    old_docs/OPEN_QUESTIONS.md 2.3 tracks the cleaner fix: move this to an
     explicit `Repo.open()` startup step so it runs once per process rather
     than on every `ObjectStore` construction, at which point the age gate
     becomes belt-and-braces rather than the load-bearing guard it is now.

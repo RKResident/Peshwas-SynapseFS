@@ -1,4 +1,4 @@
-"""Typed exceptions mapped 1:1 to SynapseFS's CLI exit codes (docs/CLI.md ~1.3).
+"""Typed exceptions mapped 1:1 to SynapseFS's CLI exit codes (old_docs/CLI.md ~1.3).
 
 Every layer of the system (store, align, codec, pack, fuse) should raise one
 of these -- never call sys.exit() directly, and never let a bare Exception
