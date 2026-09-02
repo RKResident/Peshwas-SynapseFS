@@ -58,6 +58,15 @@ class SynapseFSOperations(pyfuse3.Operations):
         self.repo = repo
         self.ref_filter = ref_filter
         self.cache = ChunkCache(cache_size_bytes)
+        # Every read is offloaded to a trio worker thread, and each in-flight
+        # decode holds a working set several times the chunk size (compressed
+        # payload, decompressed stream, unshuffled array -- and the same again
+        # for each level of the delta chain). Trio's default limiter is 40,
+        # which multiplies that transient by 40 and is what actually drives
+        # daemon RSS -- not the bounded chunk cache. The numpy half of the
+        # decode holds the GIL anyway, so extra threads buy no parallelism.
+        self.read_threads = int(os.environ.get("SYNAPSEFS_READ_THREADS", "8"))
+        self._read_limiter = trio.CapacityLimiter(self.read_threads)
         # Chunks are loose, content-addressed objects (ARCHITECTURE.md 3.3),
         # so there is no pack set to open, hold open, or close -- the object
         # store is reached through `repo.store` directly.
@@ -495,7 +504,9 @@ class SynapseFSOperations(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EBADF)
 
         # Offload decompression and row gather to thread pool
-        return await trio.to_thread.run_sync(vfile.read, off, size)
+        return await trio.to_thread.run_sync(
+            vfile.read, off, size, limiter=self._read_limiter
+        )
 
     async def release(self, fh: int) -> None:
         """Release open file handle fh."""
