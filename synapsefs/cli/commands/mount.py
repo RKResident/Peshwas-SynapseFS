@@ -45,8 +45,8 @@ def add_subparser(subparsers, global_parser: argparse.ArgumentParser) -> None:
         help="Run in the foreground rather than daemonizing",
     )
     parser.add_argument(
-        "--cache-size", default=512 * 1024 * 1024, type=int,
-        help="Hard cap on decoded-chunk cache in bytes (default: 512 MiB)",
+        "--cache-size", default=0, type=int,
+        help="Hard cap on decoded-chunk cache in bytes (default: 0 MiB). Only enable if you know what you're doing",
     )
     parser.add_argument(
         "--allow-other", action="store_true",

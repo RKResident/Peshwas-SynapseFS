@@ -15,7 +15,7 @@ from typing import Any, Optional
 class ChunkCache:
     """Thread-safe LRU cache bounded by total byte size."""
 
-    def __init__(self, max_bytes: int = 512 * 1024 * 1024) -> None:
+    def __init__(self, max_bytes: int = 0) -> None:
         self.max_bytes = max(0, max_bytes)
         self.current_bytes = 0
         self._cache: OrderedDict[Any, tuple[Any, int]] = OrderedDict()
