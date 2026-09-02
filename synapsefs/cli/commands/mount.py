@@ -36,34 +36,40 @@ CACHE SIZING
   DIFFERENT commits share nothing, need eight working sets, and will thrash a
   small cache -- decoding, evicting and re-decoding the same chunks.
 
-  Measured on a 25-epoch 90M checkpoint, 8 concurrent readers, cold, with
-  aggregate throughput, the bytes the daemon read, and that as a multiple of
-  one cold pass over the distinct files:
+  Numbers below are "daemon bytes read" as a multiple of the MINIMUM -- the
+  total size of the distinct store objects needed to reconstruct the files
+  once, computed from the manifests. 1.00x means nothing was decoded twice.
+  Measured on a 25-epoch 90M checkpoint, cold:
+
+    1 reader, one file, 512 MiB cache
+        SYNAPSEFS_READ_THREADS=1     1.00x     1.92 s
+        SYNAPSEFS_READ_THREADS=8     1.48x     1.45 s
 
     8 readers, SAME file (e.g. DDP ranks)
-         32 MiB      170 MB/s     1.9 GiB   6.6x    262 MiB RSS   <- default
-         64 MiB      183 MB/s     0.7 GiB   2.4x    294 MiB RSS
-        128 MiB      159 MB/s     0.6 GiB   1.9x    332 MiB RSS
+         32 MiB      169 MB/s     6.8x    262 MiB RSS   <- default
+         64 MiB      183 MB/s     2.4x    294 MiB RSS
+        128 MiB      159 MB/s     1.9x    332 MiB RSS
 
     8 readers, 8 DISTINCT commits
-         32 MiB       30 MB/s    69.5 GiB  29.7x    301 MiB RSS
-        256 MiB       59 MB/s    17.6 GiB   7.7x    567 MiB RSS
-        512 MiB       78 MB/s     3.3 GiB   1.4x    837 MiB RSS
-       1024 MiB       83 MB/s     3.0 GiB   1.3x   1372 MiB RSS
+         32 MiB       30 MB/s    44.9x    301 MiB RSS
+        256 MiB       59 MB/s    11.6x    567 MiB RSS
+        512 MiB       78 MB/s     2.2x    837 MiB RSS
+       1024 MiB       83 MB/s     2.0x   1372 MiB RSS
 
-  Both follow the rule: 64 MiB x distinct files puts you near the plateau, and
-  512 MiB is the knee for eight of them. Past the plateau you buy little.
+  Both follow the rule: 64 MiB x distinct files reaches the plateau, and
+  512 MiB is the knee for eight of them.
 
-  The default is adequate for the same-file case -- 170 MB/s is usable -- but
-  it is not free there either: it runs 6.6x amplified, and 64 MiB cuts that to
-  2.4x for 32 MiB more RSS. If you are serving several different checkpoints at
-  once (a sweep, a multi-commit eval, a diffing tool), the default is genuinely
-  bad and you want the rule.
+  The default is adequate for the same-file case -- 169 MB/s is usable -- but
+  not free: it runs 6.8x amplified, and 64 MiB cuts that to 2.4x for 32 MiB
+  more RSS. If one mount serves several different checkpoints at once (a
+  sweep, a multi-commit eval, a diffing tool) the default is genuinely bad.
 
-  Amplification does not go below ~2x at any cache size, because a residual
-  chunk's delta base is decoded every time the chunk is, and that decode is not
-  cached. That floor is a property of the reconstruction path, not of this
-  setting.
+  Two things worth knowing. A single reader with an adequate cache reaches
+  1.00x -- there is no inherent floor above it, and the residual/base structure
+  costs nothing extra once the cache holds the working set. And roughly 1.5x of
+  the remainder is not capacity at all but concurrency: several daemon threads
+  can miss on the same chunk before any of them finishes caching it, so each
+  decodes it. Lowering SYNAPSEFS_READ_THREADS removes that but costs wall time.
 """
 
 

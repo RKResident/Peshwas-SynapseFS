@@ -28,12 +28,24 @@ depends on it.
 *Settles:* FORMAT.md §4, FileFormat.md §7.
 *Blocks:* codec team, pack team.
 
-**1.2 Default chunk size / rows-per-chunk.**
+**1.2 Default chunk size / rows-per-chunk.** — **RESOLVED: 1 MiB.**
 *Why it matters:* the graded `residual_ratio` metric moves with it, and so does
 index size. Also the reason `commit --chunk-size` currently has `default=None`.
 *Settles:* FORMAT.md §13, `cli/commands/commit.py`.
-*What would settle it:* the codec benchmark (PLAN.md §1.2) over the tiny+small
-fixtures, sweeping sizes and plotting residual_ratio vs. index size.
+*How it was settled:* swept 512 KiB / 1 / 2 / 4 MiB over epochs 1-4 of the 90M
+benchmark. The question was framed as storage-vs-index, but the dominant axis
+turned out to be the READ path: the chunk is the unit of decoding, so a 4 KiB
+page fault from a memory-mapped reader costs a whole chunk plus its delta base.
+
+    chunk    store    commit   mmap MB/s   peak RSS   amplification
+    4 MiB   584 MiB    17.3s       35.66     293.6MB      47.0x
+    1 MiB   589 MiB    15.7s       63.65     173.8MB      10.7x
+  512 KiB   594 MiB    23.0s       63.40     148.7MB       3.1x
+
+1 MiB gives +78% mmap throughput and -41% peak daemon RSS for +0.9% stored
+bytes; the compression cost this question worried about is nearly absent at
+these sizes. See the citation on `DEFAULT_CHUNK_SIZE_BYTES` in
+`codec/checkpoint.py`. No migration needed -- chunk bounds are per-manifest.
 
 **1.3 Root-checkpoint encoding: `raw` or `raw-zstd`?**
 The first commit has no base, so its tensors are stored whole.

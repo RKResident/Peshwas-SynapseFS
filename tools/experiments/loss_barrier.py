@@ -43,7 +43,7 @@ from torchvision import datasets, transforms
 
 sys.path.insert(0, "tools")
 
-from synapsefs.align import config_parser, solver           # noqa: E402
+from synapsefs.align import config_parser, solver
 from synapsefs.align.IR import TensorRef                    # noqa: E402
 from synapsefs.align.objective import apply_col_perm, apply_row_perm  # noqa: E402
 from synapsefs.align.reader import SafetensorsReader        # noqa: E402

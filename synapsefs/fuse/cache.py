@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 #: Default cap on decoded chunks held in memory.
 #:
@@ -34,6 +34,23 @@ from typing import Any, Optional
 DEFAULT_CACHE_SIZE_BYTES = 32 * 1024 * 1024
 
 
+class _Flight:
+    """One decode in progress, and the slot its result lands in.
+
+    The result is handed to waiters through this object rather than through the
+    cache, because a small cache can evict the entry between the owner's `put`
+    and a waiter waking up -- which would send every waiter off to recompute
+    exactly what they queued to avoid.
+    """
+
+    __slots__ = ("event", "value", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.value: Any = None
+        self.error: Optional[BaseException] = None
+
+
 class ChunkCache:
     """Thread-safe LRU cache bounded by total byte size."""
 
@@ -42,6 +59,9 @@ class ChunkCache:
         self.current_bytes = 0
         self._cache: OrderedDict[Any, tuple[Any, int]] = OrderedDict()
         self._lock = threading.Lock()
+        #: key -> _Flight for decodes currently in progress. Bounded by the
+        #: number of worker threads, so it never needs eviction of its own.
+        self._inflight: dict[Any, "_Flight"] = {}
 
     def get(self, key: Any) -> Optional[Any]:
         """Fetch an item from cache and mark it most recently used."""
@@ -73,6 +93,65 @@ class ChunkCache:
 
             self._cache[key] = (val, nbytes)
             self.current_bytes += nbytes
+
+    def get_or_compute(self, key: Any, factory: Callable[[], Any],
+                       sizeof: Optional[Callable[[Any], int]] = None) -> Any:
+        """Cached value for `key`, computing it at most once across threads.
+
+        The plain check-miss-compute-put sequence has a window between the miss
+        and the put where the value is being produced but is not yet visible.
+        FUSE readahead fires several requests into the same chunk at once and
+        the worker threads pick them up together, so every one of them misses
+        and every one of them decodes the same chunk from the same bytes to the
+        same answer. Measured on the 90M benchmark, one reader, a cache far
+        larger than the working set so eviction could not be the cause:
+
+            SYNAPSEFS_READ_THREADS=1    1.00x the minimum object bytes
+            SYNAPSEFS_READ_THREADS=8    1.48x
+
+        48% of the decode work at eight threads was that race. It costs peak
+        RSS as well as time: each duplicate decode allocates its own
+        decompressed stream, unshuffled array and base block, where sharing one
+        result costs a single reference.
+
+        The first caller to miss owns the decode; the rest wait on its
+        `_Flight` and receive the same object. The cache lock is never held
+        across `factory()`, and the owner wakes its waiters from a `finally`,
+        so a decode that raises propagates to everyone instead of leaving them
+        parked forever.
+        """
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                self._cache.move_to_end(key)
+                return entry[0]
+            flight = self._inflight.get(key)
+            if flight is None:
+                flight = self._inflight[key] = _Flight()
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            flight.event.wait()
+            if flight.error is not None:
+                raise flight.error
+            return flight.value
+
+        try:
+            value = factory()
+        except BaseException as exc:
+            flight.error = exc
+            raise
+        else:
+            flight.value = value
+            nbytes = sizeof(value) if sizeof is not None else getattr(value, "nbytes", 0)
+            self.put(key, value, nbytes)
+            return value
+        finally:
+            with self._lock:
+                self._inflight.pop(key, None)
+            flight.event.set()
 
     def clear(self) -> None:
         """Clear all cached entries."""

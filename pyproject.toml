@@ -10,13 +10,28 @@ dependencies = [
     "blake3>=1.0",
     "pyfuse3>=3.3",
     "trio>=0.24",
+    # `align/lap.py` imports scipy.optimize.linear_sum_assignment at module
+    # load, and the CLI parser imports every command module, so a missing scipy
+    # breaks `synapsefs --help` -- not just alignment. It is a hard runtime
+    # dependency, not an alignment extra.
+    "scipy>=1.11",
+    # Caps BLAS threads during alignment. The import in `align/solver.py` is
+    # guarded, so a missing threadpoolctl degrades silently rather than
+    # failing -- and silently is the problem: OpenBLAS then defaults to one
+    # thread per core, which measured *slower* than the cap (6.75s at 24
+    # threads against 6.47s at 8) and 2.26x slower than a single thread would
+    # suggest is available. Declared so an evaluator does not get the slow
+    # path without being told.
+    "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]
 # torch is TEST/EXAMPLE-ONLY on purpose. It is used to prove the mount works against
 # `safetensors.torch.load_file()` and in interactive training notebooks.
 # It must never be imported by the daemon -- it costs hundreds of MB of RSS.
-dev = ["pytest>=8.0", "torch>=2.0"]
+# matplotlib is imported at module scope by tests/test_caching_plot.py, so
+# without it pytest fails during COLLECTION and no tests run at all.
+dev = ["pytest>=8.0", "torch>=2.0", "matplotlib>=3.7"]
 examples = ["torch>=2.0", "notebook"]
 
 [project.scripts]

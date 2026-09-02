@@ -45,7 +45,7 @@ import time
 
 import numpy as np
 
-from synapsefs.align import config_parser, lap, solver
+from synapsefs.align import config_parser, solver, lap
 from synapsefs.align.IR import TensorRef
 
 #: Widths to sweep. 10000 is the stress target; the curve is fitted on >= 2048,

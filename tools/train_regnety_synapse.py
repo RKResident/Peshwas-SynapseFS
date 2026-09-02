@@ -23,7 +23,7 @@ is mixed-dtype on purpose (ARCHITECTURE.md 7.7).
 
 PREREQUISITES on the training machine
 -------------------------------------
-    pip install torch torchvision timm safetensors
+    pip install torch torchvision timm safetensors tqdm
     pip install -e .                       # synapsefs itself
     # synapsefs' CLI imports pyfuse3 at module load even for `commit`, so:
     sudo apt install libfuse3-dev pkg-config && pip install pyfuse3
@@ -152,13 +152,77 @@ def build_loaders(data: Path, img_size: int, batch: int, workers: int):
     return mk(tr, True), mk(va, False), len(tr.classes)
 
 
-def train_one_epoch(model, loader, opt, scaler, sched, device, amp_dtype):
+def freeze_prefix(model, frac: float):
+    """Freeze the first `frac` of the model by parameter count.
+
+    Walks `named_parameters()` in definition order -- which for a timm CNN is
+    stem, then stages in depth order -- and freezes until the cumulative count
+    crosses the fraction. Splitting by parameter count rather than by module
+    count matters on RegNetY, where the last stage holds most of the weights:
+    freezing "half the modules" would freeze a small minority of the tensors.
+
+    **BatchNorm is put in eval() as well as having requires_grad cleared.**
+    `requires_grad=False` stops gradients, but `running_mean`, `running_var`
+    and `num_batches_tracked` are buffers, not parameters -- they keep updating
+    on every forward pass in train() mode. A "frozen" layer whose BN statistics
+    still move produces a different tensor every epoch, which for this
+    benchmark is the whole point: frozen weights are supposed to be
+    byte-identical across commits so the codec can dedupe them.
+
+    Returns (frozen_modules, frozen_params, total_params).
+    """
+    params = [(n, p) for n, p in model.named_parameters()]
+    total = sum(p.numel() for _, p in params)
+    budget = frac * total
+    seen = 0
+    frozen_names = set()
+    for name, p in params:
+        if seen >= budget:
+            break
+        p.requires_grad_(False)
+        frozen_names.add(name)
+        seen += p.numel()
+
+    # A module is frozen only if every parameter it owns is frozen; those are
+    # the ones safe to hold in eval() so their buffers stop moving.
+    frozen_modules = []
+    for mname, mod in model.named_modules():
+        owned = [f"{mname}.{n}" if mname else n
+                 for n, _ in mod.named_parameters(recurse=False)]
+        if owned and all(o in frozen_names for o in owned):
+            frozen_modules.append(mod)
+    return frozen_modules, seen, total
+
+
+def _progress(iterable, desc, total=None):
+    """tqdm bar if tqdm is installed, otherwise the iterable untouched.
+
+    Bars go to stderr and `leave=False`, so they never interleave with the
+    per-epoch results table on stdout -- that table is the artifact of this
+    run and stays machine-readable when the output is piped.
+    """
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return iterable
+    return tqdm(iterable, desc=desc, total=total, leave=False,
+                unit="batch", dynamic_ncols=True)
+
+
+def train_one_epoch(model, loader, opt, scaler, sched, device, amp_dtype,
+                    epoch=None, frozen_modules=()):
     import torch
     import torch.nn.functional as F
     model.train()
+    # model.train() re-enables buffer updates everywhere, so the frozen
+    # modules have to be put back into eval() after it, every epoch.
+    for m in frozen_modules:
+        m.eval()
     total = correct = 0
     loss_sum = 0.0
-    for x, y in loader:
+    bar = _progress(loader, f"train e{epoch}" if epoch is not None else "train",
+                    total=len(loader))
+    for x, y in bar:
         x = x.to(device, non_blocking=True, memory_format=torch.channels_last)
         y = y.to(device, non_blocking=True)
         opt.zero_grad(set_to_none=True)
@@ -173,21 +237,29 @@ def train_one_epoch(model, loader, opt, scaler, sched, device, amp_dtype):
         loss_sum += loss.item() * y.size(0)
         correct += (out.argmax(1) == y).sum().item()
         total += y.size(0)
+        if hasattr(bar, "set_postfix"):
+            bar.set_postfix(loss=f"{loss_sum / max(total, 1):.3f}",
+                            acc=f"{correct / max(total, 1):.3f}",
+                            refresh=False)
     return loss_sum / max(total, 1), correct / max(total, 1)
 
 
-def evaluate(model, loader, device, amp_dtype):
+def evaluate(model, loader, device, amp_dtype, epoch=None):
     import torch
     model.eval()
     total = correct = 0
+    bar = _progress(loader, f"val   e{epoch}" if epoch is not None else "val",
+                    total=len(loader))
     with torch.no_grad():
-        for x, y in loader:
+        for x, y in bar:
             x = x.to(device, non_blocking=True, memory_format=torch.channels_last)
             y = y.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype):
                 out = model(x)
             correct += (out.argmax(1) == y).sum().item()
             total += y.size(0)
+            if hasattr(bar, "set_postfix"):
+                bar.set_postfix(acc=f"{correct / max(total, 1):.3f}", refresh=False)
     return correct / max(total, 1)
 
 
@@ -206,6 +278,12 @@ def main() -> None:
                     help="384 is the model's native size; 224 trains far "
                          "faster and is fine for a storage benchmark")
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--freeze-frac", type=float, default=0.0,
+                    help="Freeze this fraction of the model, by parameter "
+                         "count, from the input side. 0.5 freezes the first "
+                         "half. Frozen BatchNorm is held in eval() so its "
+                         "running statistics stop moving too -- otherwise the "
+                         "'frozen' tensors still differ every epoch.")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--no-align", action="store_true",
                     help="skip alignment; see the note in the module docstring")
@@ -228,7 +306,15 @@ def main() -> None:
     model = model.to(device, memory_format=torch.channels_last)
     nparam = sum(p.numel() for p in model.parameters())
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    frozen_modules, n_frozen, n_all = (), 0, nparam
+    if args.freeze_frac > 0.0:
+        frozen_modules, n_frozen, n_all = freeze_prefix(model, args.freeze_frac)
+
+    # Only trainable parameters go to the optimizer: AdamW keeps two state
+    # tensors per parameter, so handing it frozen ones costs real memory for
+    # updates that are multiplied by a zero gradient anyway.
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.05)
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=args.lr, total_steps=args.epochs * max(len(tr), 1),
         pct_start=0.1)
@@ -244,6 +330,10 @@ def main() -> None:
 
     print(f"\n  {args.model}  {nparam/1e6:.1f}M params  bf16  "
           f"{ncls} classes  {args.img_size}px  batch {args.batch}")
+    if args.freeze_frac > 0.0:
+        print(f"  frozen: {n_frozen/1e6:.1f}M of {n_all/1e6:.1f}M params "
+              f"({100.0*n_frozen/max(n_all,1):.1f}%), {len(frozen_modules)} modules "
+              f"held in eval();  trainable {sum(p.numel() for p in trainable)/1e6:.1f}M")
     print(f"  repo: {args.repo}   epochs: {args.epochs}   device: {device}")
     print(f"\n  {'epoch':<7}{'loss':>8}{'train':>8}{'val':>8}"
           f"{'stored':>12}{'ratio':>9}{'commit':>10}{'secs':>8}")
@@ -256,8 +346,9 @@ def main() -> None:
             loss = float("nan"); tacc = float("nan")
         else:
             loss, tacc = train_one_epoch(model, tr, opt, scaler, sched,
-                                         device, amp_dtype)
-        vacc = evaluate(model, va, device, amp_dtype)
+                                         device, amp_dtype, epoch=epoch,
+                                         frozen_modules=frozen_modules)
+        vacc = evaluate(model, va, device, amp_dtype, epoch=epoch)
 
         # ---- the part that matters: write, commit, delete -----------------
         ckpt = staging / f"epoch{epoch:03d}.safetensors"

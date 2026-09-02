@@ -102,6 +102,24 @@ class VirtualSafetensorsFile:
 
         Decodes only the tensor row chunks that intersect the requested range.
         """
+        return self._read(offset, size, self._get_rows)
+
+    def try_read_cached(self, offset: int, size: int) -> "bytes | None":
+        """The same slice, but only if every chunk it needs is already decoded.
+
+        Lets the FUSE layer answer a cache hit without a thread hop. Dispatching
+        to a worker costs ~4x the request itself -- measured on a mount whose
+        read() returned a preallocated buffer, 504 MiB/s through
+        `trio.to_thread.run_sync` against 1959 MiB/s inline -- and a hit is a
+        memoryview slice, so paying that is pure loss. A miss still has to go to
+        a thread: decoding on the trio loop would stall every other request for
+        the duration.
+
+        Returns None rather than decoding, so the caller can fall back.
+        """
+        return self._read(offset, size, self._get_rows_cached)
+
+    def _read(self, offset: int, size: int, rows_fn) -> "bytes | None":
         if offset < 0 or size <= 0 or offset >= self.total_size:
             return b""
 
@@ -140,7 +158,9 @@ class VirtualSafetensorsFile:
                 if end_row <= start_row:
                     end_row = start_row + 1
 
-                rows_data = self._get_rows(seg.name, start_row, end_row)
+                rows_data = rows_fn(seg.name, start_row, end_row)
+                if rows_data is None:
+                    return None          # cached-only probe: let the caller decode
                 raw_view = memoryview(rows_data).cast("B")
 
                 byte_lo = rel_start - start_row * seg.row_nbytes
@@ -159,16 +179,41 @@ class VirtualSafetensorsFile:
         return spans
 
     def _chunk_rows(self, name: str, lo: int, hi: int) -> np.ndarray:
-        """One whole chunk, cached under its own row span."""
+        """One whole chunk, cached under its own row span.
+
+        `get_or_compute` rather than get/miss/put: concurrent readers of the
+        same chunk otherwise all miss and all decode it. See its docstring.
+        """
         if self.cache is None:
             return self.checkpoint.rows(name, lo, hi)
         key = (self.checkpoint.commit_hash, name, lo, hi)
-        hit = self.cache.get(key)
-        if hit is not None:
-            return hit
-        rows = self.checkpoint.rows(name, lo, hi)
-        self.cache.put(key, rows, rows.nbytes)
-        return rows
+        return self.cache.get_or_compute(
+            key, lambda: self.checkpoint.rows(name, lo, hi))
+
+    def _get_rows_cached(self, name: str, start_row: int,
+                         end_row: int) -> "np.ndarray | None":
+        """`_get_rows` restricted to chunks already in the cache. None on a miss.
+
+        Deliberately does not fall back to `checkpoint.rows` for an uncovered
+        span the way `_get_rows` does: that path decodes, which is exactly what
+        this probe exists to avoid.
+        """
+        if self.cache is None:
+            return None
+        spans = self._spans(name)
+        covering = [(lo, hi) for lo, hi in spans if hi > start_row and lo < end_row]
+        if not covering:
+            return None
+        commit = self.checkpoint.commit_hash
+        pieces = []
+        for lo, hi in covering:
+            hit = self.cache.get((commit, name, lo, hi))
+            if hit is None:
+                return None
+            pieces.append(hit)
+        block = pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=0)
+        base = covering[0][0]
+        return block[start_row - base:end_row - base]
 
     def _get_rows(self, name: str, start_row: int, end_row: int) -> np.ndarray:
         """Rows `[start_row, end_row)`, decoding each chunk at most once.

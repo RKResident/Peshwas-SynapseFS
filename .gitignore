@@ -62,3 +62,4 @@ tools/tools/benchmark-mlp-seed1synapsefs/networking/spp
 networking_test_target/
 crash_check.bash
 krish_bug/
+tools/tools/align_tracing
