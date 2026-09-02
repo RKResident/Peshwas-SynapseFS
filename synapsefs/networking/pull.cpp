@@ -13,6 +13,9 @@
 
 #include "network_common.hpp"
 
+// pulls a repositry from a client running the push function. returns 0 on success,
+// non-zero on failure. requires the network client (which it does not own) and the
+// name of a valid branch to pull
 int pull(const int client, const std::string branch) {
     if(!is_valid_branch_name(branch)) {
         return Err_INVALID_INVOKATION;
@@ -20,9 +23,10 @@ int pull(const int client, const std::string branch) {
     std::vector<Hash> req_hash_objects;
 
     uint32_t rho_len;
-    if(!recv_all(client, &rho_len, sizeof(rho_len))) { return 1; }
+    if(!recv_all(client, &rho_len, sizeof(rho_len))) { return Err_NETWORK_ERROR; }
     rho_len = ntohl(rho_len);
     if((rho_len & err_high) == err_high) {
+        // detect errors
         std::cerr << "peer error: " << get_err(rho_len ^ err_high);
         return Err_PEER_ERROR;
     }
@@ -45,22 +49,30 @@ int pull(const int client, const std::string branch) {
     for(uint32_t i = 0; i < rho_len; i++) {
         hash_exists[i] = has_hash(req_hash_objects[i]);
     }
-    std::cout << "sending hash status..." << std::endl;
+    std::cout << "sending hash status" << std::endl;
     if(!send_all(client, hash_exists.data(), hash_exists.size())) { return Err_NETWORK_ERROR; }
     std::cout << "sent hash status" << std::endl;
+
+    int skipped = 0;
+    int transferred = 0;
     
+    // recieve nonexistent hash objects, skip existing ones
     for(uint32_t i = 0; i < rho_len; i++) {
         if(hash_exists[i]) {
             std::cout << "skipping hash " << req_hash_objects[i] << ": already exists" << std::endl;
+            skipped++;
             continue;
         }
-        std::cout << "receiving hash " << req_hash_objects[i] << "..." << std::endl;
+        std::cout << "receiving hash " << req_hash_objects[i] << std::endl;
         if(int err = recv_file(client, hash_path(req_hash_objects[i]))) {
             return err;
         }
         std::cout << "received hash " << req_hash_objects[i] << std::endl;
+        transferred++;
     }
 
+    // Since hashes are stored in reverse hierarchical order (near-DFS), the last one is the root,
+    // which is the commit object. The hash of this is stored in refs/heads/<branch>
     if(req_hash_objects.empty()) {
         std::cerr << "peer sent no objects for branch '" << branch
                   << "'; leaving refs untouched" << std::endl;
@@ -93,12 +105,16 @@ int pull(const int client, const std::string branch) {
         return Err_FILESYSTEM_ERROR;
     }
 
+    // make sure it's atomic!
     std::filesystem::rename(branch_head_tmp_path, branch_head_path, ec);
     if(ec) {
         std::filesystem::remove(branch_head_tmp_path);
         return Err_FILESYSTEM_ERROR;
     }
-    std::cout << "Transfer Complete" << std::endl;
+
+    std::cout << "Transfer Complete: "
+        << (skipped+transferred) << " objects, " << transferred << " transferred"
+        << skipped << " skipped, " << std::endl;
 
     return 0;
 }

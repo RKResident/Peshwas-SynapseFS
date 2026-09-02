@@ -12,6 +12,8 @@
 #include "pull.cpp"
 #include "network_common.hpp"
 
+// creates a server which listens for push and pull requests from clients,
+// and handles very basic validataion
 int serve(uint16_t port, bool ro) {
     int server = socket(AF_INET, SOCK_STREAM, 0);
     if(server < 0) {
@@ -22,6 +24,7 @@ int serve(uint16_t port, bool ro) {
     int opt = 1;
     setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    // b-b-b-boiler plaaaaaate
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
@@ -49,7 +52,9 @@ int serve(uint16_t port, bool ro) {
             close(server);
             return Err_NETWORK_ERROR;
         }
+        // boiler plate over
 
+        // first recieve operation (push or pull)
         uint8_t op;
         if(!recv_all(client, &op, sizeof(op))) {
             close(client);
@@ -76,8 +81,10 @@ int serve(uint16_t port, bool ro) {
                 if(!ro) {
                     Status st = St_ACCEPTED;
                     send_all(client, &st, sizeof(st));
+                    // accept the connection and then let pull handle everything
                     pull(client, client_branch);
                 } else {
+                    // if a read-only server recieves a pull, then reject it
                     Status st = St_DECLINED;
                     send_all(client, &st, sizeof(st));
                     close(client);

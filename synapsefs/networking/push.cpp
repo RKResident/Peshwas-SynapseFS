@@ -1,4 +1,3 @@
-#include <chrono>
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -13,7 +12,8 @@
 #include "nlohmann/json.hpp"
 #include "network_common.hpp"
 
-
+// The next few functions recursively gets the child objects of hash objects.
+// They're all very similar, and there's really not much too them
 int tensor_get_objects(const Hash &hash, HashList &req_hash_objects) {
     if(req_hash_objects.contains(hash)) {return 0;}
     std::string fp = hash_path(hash);
@@ -109,7 +109,6 @@ int tensor_get_objects(const Hash &hash, HashList &req_hash_objects) {
 
     return 0;
 }
-
 int checkpoint_get_objects(const Hash &hash, HashList &req_hash_objects) {
     if(req_hash_objects.contains(hash)) {return 0;}
     std::string fp = hash_path(hash);
@@ -184,7 +183,6 @@ int checkpoint_get_objects(const Hash &hash, HashList &req_hash_objects) {
     
     return 0;
 }
-
 int commit_get_objects(const Hash &hash, HashList &req_hash_objects) {
     if(req_hash_objects.contains(hash)) {return 0;}
     std::string fp = hash_path(hash);
@@ -244,7 +242,6 @@ int commit_get_objects(const Hash &hash, HashList &req_hash_objects) {
     
     return 0;
 }
-
 int branch_get_objects(const std::string &branch, HashList &req_hash_objects) {
     std::string fp = branch_path(branch);
     std::ifstream f(fp, std::ios::binary);
@@ -265,6 +262,9 @@ int branch_get_objects(const std::string &branch, HashList &req_hash_objects) {
     return 0;
 }
 
+// pushes a repositry to a client running the pull function. returns 0 on success,
+// non-zero on failure. request the network client (which it also does not own) and
+// the name of a valid, existing, branch to pull
 int push(const int client, const std::string branch) {
     if(!is_valid_branch_name(branch)) {
         return Err_INVALID_INVOKATION;
@@ -272,8 +272,6 @@ int push(const int client, const std::string branch) {
     HashList req_hash_objects;
     if(int err = branch_get_objects(branch, req_hash_objects)) {
         std::cerr << "could not resolve branch: " << branch << std::endl;
-        // The peer is waiting on a length-prefixed lists; send an empty one so
-        // it fails cleanly instead of blocking on a socket that never speaks.
         uint32_t err_net = htonl(err_high | err);
         send_all(client, &err_net, sizeof(err_net));
         return err;
@@ -295,18 +293,27 @@ int push(const int client, const std::string branch) {
     if(!recv_all(client, hash_exists.data(), rho_len)) { return Err_NETWORK_ERROR; }
     std::cout << "received hash status" << std::endl;
 
+    int skipped = 0;
+    int transferred = 0;
+
     for(uint32_t i = 0; i < rho_len; i++) {
         if(hash_exists[i]) {
             std::cout << "skipping hash " << req_hash_objects.ordered[i]
                 << ": already exists" << std::endl;
+            skipped++;
             continue;
         }
-        std::cout << "sending hash " << req_hash_objects.ordered[i] << "..." << std::endl;
+        std::cout << "sending hash " << req_hash_objects.ordered[i] << std::endl;
         if(int err = send_file(client, hash_path(req_hash_objects.ordered[i]))) {
             return err;
         }
         std::cout << "sent hash " << req_hash_objects.ordered[i] << std::endl;
+        transferred++;
     }
+
+    std::cout << "Transfer Complete: "
+        << (skipped+transferred) << " objects, " << transferred << " transferred"
+        << skipped << " skipped, " << std::endl;
 
 
     return 0;

@@ -11,6 +11,7 @@
 #include "network_common.hpp"
 #include "serve.cpp"
 
+// connects to a server running `serve`
 int connect_server(const std::string ip, const uint16_t port, const std::string branch,
         Operation op, bool &success) {
     if(!is_valid_branch_name(branch)) {

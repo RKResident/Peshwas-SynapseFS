@@ -13,17 +13,22 @@
 #include <vector>
 #include <unordered_set>
 
+// length of hash in lowercase base 16
 const int hash_len = 64;
 
+// operation requested by client
 enum Operation : uint16_t {
     Op_PUSH = 0,
     Op_PULL = 1
 };
+// status of server after recieving request
 enum Status : uint16_t {
     St_DECLINED = 0,
     St_ACCEPTED = 1
 };
+// high bits of error mask
 const uint32_t err_high = 0xFFFF0000;
+// error codes
 enum Error : uint16_t {
     Err_OK      = 0,
     Err_INVALID_INVOKATION  = 1,
@@ -35,6 +40,7 @@ enum Error : uint16_t {
     Err_PEER_ERROR          = 7,
 };
 
+// error names
 inline const std::string get_err(const uint32_t err) {
     switch((Error)err) {
         case Err_OK:
@@ -58,8 +64,10 @@ inline const std::string get_err(const uint32_t err) {
     }
 }
 
+// way to store lowercase bash 16 hash
 typedef std::array<char, hash_len> Hash;
 
+// helper operator
 inline std::ostream& operator<<(std::ostream& os, const Hash& hash) {
     for (char c : hash) {
         os << c;
@@ -67,6 +75,7 @@ inline std::ostream& operator<<(std::ostream& os, const Hash& hash) {
     return os;
 }
 
+// Hash function for hashes
 struct HashHasher {
     std::size_t operator()(const Hash &hash) const noexcept {
         std::size_t h = 0;
@@ -79,7 +88,11 @@ struct HashHasher {
         return h;
     }
 };
-struct HashList {
+
+// This class allows hashes to be inserted into it, preserving
+// order and also removing duplicates
+class HashList {
+public:
     std::vector<Hash> ordered;
     std::unordered_set<Hash, HashHasher> seen;
 
@@ -95,11 +108,8 @@ struct HashList {
         return seen.find(hash) != seen.end();
     }
 };
-/* A hash arriving over the network becomes a FILE PATH, so validating it is a
- * security boundary rather than tidiness: 64 bytes containing '/' and '.' walk
- * out of the object store and write anywhere the process can reach. Length
- * alone was checked, which does not stop that.
- */
+
+// checks if a c-style string is a valid hash
 inline bool is_hex_hash(const char *str, std::size_t len) {
     if(len != hash_len) {
         return false;
@@ -112,13 +122,16 @@ inline bool is_hex_hash(const char *str, std::size_t len) {
     }
     return true;
 }
+// checks if a `Hash` object is a valid hash
 inline bool is_hex_hash(const Hash &hash) {
     return is_hex_hash(hash.data(), hash_len);
 }
+// checks if a C++ string is a valid hash
 inline bool is_hex_hash(const std::string &hash) {
     return is_hex_hash(hash.c_str(), hash.size());
 }
 
+// converts a c-style null-terminated string into a `Hash` object
 inline void make_hash(Hash &out, const char *str) {
     if(!is_hex_hash(str, std::strlen(str))) {
         std::cerr << str << std::endl;
@@ -128,19 +141,24 @@ inline void make_hash(Hash &out, const char *str) {
     std::memcpy(out.data(), str, hash_len);
 }
 
+// where temporary files go (bazooa!)
 inline std::string tmp_path(const std::string &file_name) {
     return "objects/tmp/" + file_name;
 }
 
+// where the branch files go
 inline std::string branch_path(const std::string &branch) {
     return "refs/heads/" + branch;
 }
+// take a guess
 inline bool is_valid_branch_name(const std::string &branch) {
     if(branch.size() == 0) {
         return false;
     }
     char prev = '/';
     for(char c : branch) {
+        // alphanumeric characters, _, and -, allowed without restriction, / allowed
+        // if it's not at the beginning or end, or consecutive
         if((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
                 || c == '_' || c == '-' || (c == '/' && prev != '/')) {
             prev = c;
@@ -166,6 +184,7 @@ inline std::string hash_path(const Hash hash) {
     return path;
 }
 
+// true if a file with the path `hash_path(hash)` exists for a given hash
 inline bool has_hash(const Hash hash) {
     std::filesystem::path file_path = hash_path(hash);
     if(std::filesystem::exists(file_path)) {
@@ -175,6 +194,8 @@ inline bool has_hash(const Hash hash) {
     }
 }
 
+// since _apparently_, send(...) doesn't actually necessarily send all the
+// data you tell it to send, I made this
 inline bool send_all(int sock, const void* data, size_t len) {
     const char* ptr = static_cast<const char*>(data);
     while(len > 0) {
@@ -193,6 +214,7 @@ inline bool send_all(int sock, const void* data, size_t len) {
     }
     return true;
 }
+// symmetric role to `send_all` in place of `send` but with `recv`
 inline bool recv_all(int sock, void* data, size_t len) {
     char* ptr = static_cast<char*>(data);
     while(len > 0) {
@@ -212,12 +234,14 @@ inline bool recv_all(int sock, void* data, size_t len) {
     return true;
 }
 
+// sends a string in the form [network-endian uint32_t size][raw bytes]
 inline bool send_string(int sock, const std::string &str) {
     uint32_t len = htonl(static_cast<uint32_t>(str.size()));
 
     return send_all(sock, &len, sizeof(len)) &&
            send_all(sock, str.data(), str.size());
 }
+// recieves a string of the form [network-endian uint32_t size][raw bytes]
 inline bool recv_string(int sock, std::string &str) {
     uint32_t net_len;
     if(!recv_all(sock, &net_len, sizeof(net_len))) { return false; }
@@ -226,12 +250,14 @@ inline bool recv_string(int sock, std::string &str) {
     return recv_all(sock, str.data(), len);
 }
 
+// sends a file in the form [network-endian uint32_t size][raw bytes]
 inline int send_file(int sock, const std::filesystem::path& path) {
     std::error_code ec;
     auto file_size = std::filesystem::file_size(path, ec);
     if(ec || file_size > UINT32_MAX) {
         uint32_t err = htonl(err_high | Err_FILESYSTEM_ERROR);
-        if(!send_all(sock, &err, sizeof(err))) { return Err_NETWORK_ERROR; }
+        // if there's an error, the peer detects it if the "size" is too high ((size & hash) == hash)
+        if(!send_all(sock, &err, sizeof(err))) { return Err_FILESYSTEM_ERROR; }
         return Err_FILESYSTEM_ERROR;
     }
 
@@ -265,6 +291,7 @@ inline int send_file(int sock, const std::filesystem::path& path) {
 
     return 0;
 }
+// recieves a file of the form [network-endian uint32_t size][raw bytes]
 inline int recv_file(int sock, const std::filesystem::path& final_path) {
     uint32_t net_len;
     if(!recv_all(sock, &net_len, sizeof(net_len))) {
